@@ -1,0 +1,11 @@
+[package]
+name = "diagwire-hsfz"
+description = "HSFZ diagnostic-over-Ethernet transport for BMW F/G-series gateways"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

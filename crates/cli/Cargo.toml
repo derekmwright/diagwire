@@ -1,0 +1,17 @@
+[package]
+name = "diagwire-cli"
+description = "Command-line front end for diagwire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "diagwire"
+path = "src/main.rs"
+
+[dependencies]
+diagwire.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

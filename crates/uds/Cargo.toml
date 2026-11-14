@@ -1,0 +1,9 @@
+[package]
+name = "diagwire-uds"
+description = "UDS (ISO 14229) request builders and response parsers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
