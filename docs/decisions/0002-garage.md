@@ -1,6 +1,6 @@
 # DR-0002: Garage — vehicles, history and service log
 
-**Status:** judge SETTLED (2026-11-14) in a fresh pass after an architectural review (rounds 8 → 4 → 2 → review → 0; verdicts and review in `docs/notes/`). Awaiting the maintainer's answers to Q1–Q3, then accepted. Not accepted. Battery registration and clear-faults move to DR-0003 (v0 is read-only per DR-0001 Q4).
+**Status:** judge SETTLED (2026-11-14) in a fresh pass after an architectural review (rounds 8 → 4 → 2 → review → 0; verdicts and review in `docs/notes/`). **Accepted** (maintainer, 2026-11-14). All open questions answered. Battery registration and clear-faults move to DR-0003 (v0 is read-only per DR-0001 Q4).
 **Depends on:** DR-0001 (operation tiers D6, development-agent boundary D7).
 **Author fill-in:** round 2, 2026-11-14, revising against judge round 1 (`docs/notes/2026-11-14-dr0002-judge-r1.md`) and the architect's round-2 rulings, merged onto the architect's on-disk edits. No garage code exists, so nothing below cites code; every requirement is a requirement, not a demonstrated protection. Claims about SQLite and `rusqlite` are tagged with the source checked (legend under *Authorities*) or marked **unverified**. "The maintainer" in the G-lines means whoever owns that garage, which per G0 is any user.
 
@@ -156,8 +156,8 @@ Stop conditions: the bundled build fails on Windows or Linux; test 5's version e
 
 ## Open questions for the maintainer (answerable in one line; cost given)
 
-1. **Note import:** ship a general import feature (any user can bring in prior notes or records, labelled `imported-note`), which we then use for our own five cars? (Per G0 it's a product feature, not a one-off script.)
-2. **Automatic session logging:** store every MCP read as a snapshot automatically, or only when asked? (Automatic makes "what's new since last time" work with no extra step.)
-3. **Odometer unit:** miles only (US fleet), or a unit per record? (Per-record costs one column and supports any car later.)
+1. **Note import:** ship a general import feature (any user can bring in prior notes or records, labelled `imported-note`), which we then use for our own five cars? (Per G0 it's a product feature, not a one-off script.) **Answered (maintainer, 2026-11-14): yes**, a general import feature, always labelled `imported-note`.
+2. **Automatic session logging:** store every MCP read as a snapshot automatically, or only when asked? (Automatic makes "what's new since last time" work with no extra step.) **Answered (maintainer, 2026-11-14): automatic.**
+3. **Odometer unit:** miles only (US fleet), or a unit per record? (Per-record costs one column and supports any car later.) **Answered (maintainer, 2026-11-14): a unit per record** (as G10 already states).
 4. **Garage location:** default OS data directory, or a path you choose? (Either way it can be overridden.) **Answered (maintainer, 2026-11-14): the user's local app-data directory**, per OS (G1).
 5. **VINs in MCP results:** redact by default and refer to vehicles by label (VINs are filtered from what the AI provider receives, best effort per G8), or include them? (Redaction costs a little convenience. Including them sends VINs to the AI provider on every garage query.) **Answered (maintainer, 2026-11-14): redacted by default in everything sent to the AI client** ("the VIN isn't needed at the provider edge").
