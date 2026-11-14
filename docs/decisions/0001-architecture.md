@@ -1,6 +1,6 @@
 # DR-0001: Architecture, authorities and safety boundary
 
-**Status:** judge SETTLED in round 3 (2026-11-14; rounds required 10 → 2 → 0 changes; verdicts in `docs/notes/`). Awaiting the maintainer's answer to Q4, then accepted. No production code until it is.
+**Status:** **Accepted** (maintainer, 2026-11-14). Judge settled in round 3 (rounds required 10 → 2 → 0 changes; verdicts in `docs/notes/`). All open questions answered.
 **Spike:** everything under `crates/` at this date is a spike written before this record. It is disposable and needs an explicit productionization decision.
 **Author fill-in:** round 2, 2026-11-14. This round revises against judge round 1 (`docs/notes/2026-11-14-dr0001-judge-r1.md`) and the architect's rulings. The spike's provenance is commit `2abb6e0` (github.com/derekmwright/diagwire). Citation legend: `hsfz:N`, `uds:N`, `ds2:N` and `diagwire:N` mean `crates/<crate>/src/lib.rs` line N at `2abb6e0`. `cli:N` means `crates/cli/src/main.rs`. `INI:N` means the maintainer's local `C:\EDIABAS\Bin\EDIABAS.INI` (EDIABAS 7.3.0), which I read but did not change. D4–D7 carry r2 revisions approved by the architect; D10 is new in r2.
 
@@ -49,14 +49,14 @@ diagwire may only claim a protocol behavior that is checked against an authority
   - *Spike:* **Matches.** Requests are hard-coded builders (`uds:29-41`), with no job files and no interpreter.
   - *Reopen if:* the first verified BMW-specific DID or DS2 job lands.
 
-- **D6 Product boundary (revised r2, maintainer 2026-11-14):** the product's AI user reaches hardware only through an MCP server the maintainer starts with the cable attached. Starting the server is the consent for reads. It exposes only operations on a reviewed read allowlist. Discovery is live I/O. The state-changing tier is **pending Q4**. Coding and flashing are not exposed.
+- **D6 Product boundary (revised r2, maintainer 2026-11-14):** the product's AI user reaches hardware only through an MCP server the maintainer starts with the cable attached. Starting the server is the consent for reads. It exposes only operations on a reviewed read allowlist. Discovery is live I/O. **v0 is read-only** (Q4): there is no state-changing tier. Coding and flashing are not exposed.
   - *Read tier:* An allowlist entry names the operation, transport, exact request template (service, subfunction, permitted parameter values), target ECUs, response decoder, the register rows it depends on, and the reviewer and date. Entries come from review, never from the model, and an operation qualifies because it was reviewed, not because it is called a read. The v0 candidates are `discover` and single-ECU `read_dtcs` (0x19 0x02 mask). There is no functional scan (D10), no generic raw-request tool, and no per-DID read until that DID has its own entry.
   - *Assumptions (unverified, see register):* that these reads don't change ECU state, that a clear erases freeze-frame data, and what 0xDF fans out to. Whatever rests on them must be checked against the authority before its allowlist entry is approved.
-  - *Enforcement:* Front ends (MCP **and** CLI, security addendum A3) link only the allowlisted operations API. The re-exported raw transport (`pub use diagwire_hsfz as hsfz`, `diagwire:7`; `Connection::send`, `hsfz:143`) and the raw `Session::request` (`diagwire:44-61`) must not be reachable from any front end, whichever way Q4 is answered. The server opens live transport only when the maintainer launches it (development agents never do, D7).
-  - *State-changing tier:* pending Q4. Until it is answered, no front end has any state-changing operation.
+  - *Enforcement:* Front ends (MCP **and** CLI, security addendum A3) link only the allowlisted operations API. The re-exported raw transport (`pub use diagwire_hsfz as hsfz`, `diagwire:7`; `Connection::send`, `hsfz:143`) and the raw `Session::request` (`diagwire:44-61`) must not be reachable from any front end. The server opens live transport only when the maintainer launches it (development agents never do, D7).
+  - *State-changing tier:* none in v0 (Q4). No front end has any state-changing operation. `clear_faults` and battery registration, with their approval mechanism, belong to DR-0003.
   - *Alternatives:* All tools free (breaks the governing rule). A session-level unlock for writes (not per-action).
   - *Spike:* **Does not match.** There is no MCP crate. The raw transport is public through `diagwire:7`, and `Session::request` is public and panics on an empty request (`diagwire:45`). The CLI reaches `hsfz` directly. `uds::clear_all_dtcs` (`uds:34-36`) has no caller.
-  - *Reopen if:* MCP gains a standard human-approval primitive, or Q4 is answered.
+  - *Reopen if:* MCP gains a standard human-approval primitive, or DR-0003 is accepted.
 
 - **D7 Development-agent boundary (revised r2, maintainer 2026-11-14):** development agents never initiate hardware I/O: no discovery, no connect, no CLI or server run against a real link. Tests use injectable fake streams only. Hardware runs are maintainer-run.
   - *Reason:* An agent's mistake on a live bus can change vehicle state. Fakes make splits, timeouts and alive checks deterministic.
@@ -102,7 +102,7 @@ Coding, flashing, BEST/2 interpreter, ICOM, MOST, DoIP (TCP 13400), Bluetooth/EL
 5. The K-line echo of our request comes back with one corrupted byte.
    - **Unknown: no K-line transport, no echo handling** (the plan exists only as a doc comment, `ds2:5-7`). `ds2::decode` rejects telegrams with a bad checksum (`ds2:49-69`). It knows nothing about echoes. EDIABAS's behavior is the authority.
 6. An MCP client calls `clear_faults` without confirmation, and with a forged confirmation.
-   - **Not applicable yet.** There is no MCP and no clear operation. Pending Q4. The raw transport must be unreachable either way (D6).
+   - **Not applicable yet.** There is no MCP and no clear operation, and v0 has none (Q4: read-only). The replay belongs to DR-0003. The raw transport must be unreachable regardless (D6).
 7. An unstamped fixture, or one captured from diagwire itself, is loaded.
    - **Unknown: no loader or gate** (D4).
 8. A DTC response has a record count that isn't a multiple of 4.
@@ -163,7 +163,7 @@ Out: scanning, MCP, DS2, clear. Stop conditions: the capture contradicts a spike
 1. **Judge:** which other vendor's model, and how is it invoked? **Answered (maintainer, 2026-11-14): Codex CLI**, run as `codex exec --sandbox read-only`.
 2. **License:** MIT/Apache-2.0 dual (Rust norm), or other? **Answered (maintainer, 2026-11-14): MIT OR Apache-2.0**, applied in `LICENSE-MIT`, `LICENSE-APACHE` and `workspace.package.license`.
 3. **Public repo:** push to GitHub now, or after DR-0001 is accepted? **Answered (maintainer, 2026-11-14): now.** Public at github.com/derekmwright/diagwire from `2abb6e0`.
-4. **`clear_faults` (rewritten r2):** (a) exclude clear from v0 and defer it to its own record together with battery registration (DR-0003; DR-0002 is the garage), or (b) allow it with single-use human approval bound to vehicle, ECU, operation and parameters, consumed once, on every hardware entry point? ((a) costs nothing now. (b) needs an approval channel the model can't forge. Making clear CLI-only does not remove replay 6 unless an agent cannot invoke that CLI.)
+4. **`clear_faults` (rewritten r2):** (a) exclude clear from v0 and defer it to its own record together with battery registration (DR-0003; DR-0002 is the garage), or (b) allow it with single-use human approval bound to vehicle, ECU, operation and parameters, consumed once, on every hardware entry point? ((a) costs nothing now. (b) needs an approval channel the model can't forge. Making clear CLI-only does not remove replay 6 unless an agent cannot invoke that CLI.) **Answered (maintainer, 2026-11-14): (a), v0 is read-only.** Clear-faults moves to DR-0003 with battery registration.
 5. **Name:** keep `diagwire`? **Answered (maintainer, 2026-11-14): yes.**
 
 **Answered 2026-11-14, hardware I/O by role:** development agents never initiate hardware I/O, including discovery, connect and CLI runs, and tests use injectable fake streams only. The product's AI user may run reviewed, allowlisted reads only through an MCP server the maintainer starts with the cable attached, and starting it is the consent for reads. Discovery counts as live I/O. Recorded in D6 and D7.

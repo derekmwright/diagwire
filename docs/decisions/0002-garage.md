@@ -1,6 +1,6 @@
 # DR-0002: Garage — vehicles, history and service log
 
-**Status:** skeleton (architect, 2026-11-14). Not accepted. Second record in flight, alongside DR-0001. Battery registration and clear-faults move to DR-0003.
+**Status:** skeleton (architect, 2026-11-14). Not accepted. Battery registration and clear-faults move to DR-0003 (v0 is read-only per DR-0001 Q4).
 **Depends on:** DR-0001 (operation tiers D6, development-agent boundary D7).
 
 ## Governing rule

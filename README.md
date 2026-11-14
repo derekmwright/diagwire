@@ -24,7 +24,7 @@ Set `RUST_LOG=debug` to log every frame in hex.
 
 ## Status
 
-**Everything in `crates/` is a spike** written before [DR-0001](docs/decisions/0001-architecture.md). It is disposable until that record is accepted.
+[DR-0001](docs/decisions/0001-architecture.md) (architecture, authorities, safety boundary) is **accepted**. v0 is read-only. **Everything in `crates/` is still a spike** written before it. It gets productionized slice by slice against the record, starting with the first slice in DR-0001.
 
 - HSFZ and UDS code is written from public protocol notes and still needs checking against a real car.
 - DS2 is framing only. The serial transport comes after capturing real traffic through EDIABAS.
