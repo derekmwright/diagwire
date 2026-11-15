@@ -1,6 +1,6 @@
 # DR-0001: Architecture, authorities and safety boundary
 
-**Status:** **Accepted** (maintainer, 2026-11-14). Judge settled in round 3 (rounds required 10 → 2 → 0 changes; verdicts in `docs/notes/`). All open questions answered.
+**Status:** **Accepted** (maintainer, 2026-11-14). Judge settled in round 3 (rounds required 10 → 2 → 0 changes; verdicts in `docs/notes/`). All open questions answered. **Amendment A1 (read-only probe) is a draft at the end of this record: requested by the maintainer 2026-11-15, not judged, not accepted.** Until it is accepted, D6 and D10 stand as written above.
 **Spike:** everything under `crates/` at this date is a spike written before this record. It is disposable and needs an explicit productionization decision.
 **Author fill-in:** round 2, 2026-11-14. This round revises against judge round 1 (`docs/notes/2026-11-14-dr0001-judge-r1.md`) and the architect's rulings. The spike's provenance is commit `2abb6e0` (github.com/derekmwright/diagwire). Citation legend: `hsfz:N`, `uds:N`, `ds2:N` and `diagwire:N` mean `crates/<crate>/src/lib.rs` line N at `2abb6e0`. `cli:N` means `crates/cli/src/main.rs`. `INI:N` means the maintainer's local `C:\EDIABAS\Bin\EDIABAS.INI` (EDIABAS 7.3.0), which I read but did not change. D4–D7 carry r2 revisions approved by the architect; D10 is new in r2.
 
@@ -167,3 +167,33 @@ Out: scanning, MCP, DS2, clear. Stop conditions: the capture contradicts a spike
 5. **Name:** keep `diagwire`? **Answered (maintainer, 2026-11-14): yes.**
 
 **Answered 2026-11-14, hardware I/O by role:** development agents never initiate hardware I/O, including discovery, connect and CLI runs, and tests use injectable fake streams only. The product's AI user may run reviewed, allowlisted reads only through an MCP server the maintainer starts with the cable attached, and starting it is the consent for reads. Discovery counts as live I/O. Recorded in D6 and D7.
+
+## Amendment A1 (draft): read-only probe
+
+**Status:** draft, 2026-11-15. The maintainer asked for it in these words: a read-only probe of different modules that gathers read-out values. Not judged and not accepted. The code it describes exists on the branch (`60f0303`, worker note `docs/notes/2026-11-15-probe-worker.md`) and was built ahead of this text at the maintainer's request. If the amendment is rejected or changed, that code changes or goes.
+
+**What it changes.** D6 says: "no functional scan (D10), no generic raw-request tool, and no per-DID read until that DID has its own entry." A1 replaces the last clause and adds one operation. The first two stay.
+
+- **A1.1 Read list:** an operation may send only ReadDTCInformation (`0x19`) and ReadDataByIdentifier (`0x22`). The check sits below every operation, so a request for any other service is refused before a byte is written. There is still no raw-request tool: a caller chooses an ECU address, a status mask or a 16-bit identifier, never the bytes.
+  - *Reason:* the governing rule forbids changing vehicle state without per-action consent, and v0 has no approval mechanism. A fixed list of read services keeps v0 read-only without a review per identifier.
+  - *Consequence:* any identifier may be read from any single ECU. D6's allowlist entry per identifier is no longer required for a read. It is still required before diagwire *names or scales* a value (D5).
+  - *Assumption, unverified (register):* that `0x19` and `0x22` change no ECU state for any subfunction, mask or identifier. ISO 14229-1 has not been checked for this, and a manufacturer-specific identifier could behave differently. A1 accepts this risk for these two services. It does not extend to any other service.
+- **A1.2 Values are uninterpreted:** `read_data` returns the bytes the ECU sent, and every display says so. diagwire attaches no name, unit or scaling (D5 and D8 are unchanged).
+  - *Consequence:* what an AI client says the bytes mean is interpretation and is labelled as such, as DR-0003 C8 requires for codes.
+- **A1.3 Sequential probe:** "which modules are there" is answered by asking each address in turn for its fault memory, one transaction at a time under D10. An address that answers, with a fault list or a refusal, is present. The functional address (`0xDF`) and the tester's address are never asked, so D10's ban on functional scanning stands.
+  - *Reason:* D10 already says "all ECUs" becomes sequential single-ECU reads. It asks for an address list confirmed by a capture; A1 drops that condition for the probe, because finding the addresses is the probe's purpose.
+  - *Consequence:* a silent address costs its timeout (2 s as built) and a new connection, since D10 closes the connection after it. A full sweep of 254 addresses with few modules present takes several minutes and opens a connection per silent address. What a real gateway does when asked for an address nobody holds (silence, or an error frame) is **unverified**.
+  - *Consequence:* "present" means "answered this request". A module that does not answer `0x19 02` within the timeout is not listed. Absence from the list proves nothing.
+
+**What it does not change.** No clear, write, routine, reset, session change or tester-present. No functional request. No BMW names, texts or scaling (D8). Development agents still never start hardware I/O (D7): the probe is maintainer-run, or run by the product's AI user through the MCP server once that exists. D6's enforcement paragraph (front ends reach only the operations API) is still owed by the operations-boundary slice.
+
+**Replays this adds.**
+1. A caller asks an operation to send `0x14`, `0x2E`, `0x31`, `0x11`, `0x10` or `0x3E`: refused, nothing written (`only_read_services_are_ever_sent`).
+2. A probe list contains `0xDF` or the tester address: the whole probe is refused before a connection is opened (`probe_refuses_functional_and_tester_addresses_before_any_io`).
+3. One address in a probe stays silent: it is reported as no response, the connection is replaced, and the addresses after it are still asked (`probe_asks_each_address_in_turn`).
+4. A `0x22` reply echoes a different identifier: malformed, connection closed, no bytes returned (`read_data_rejects_replies_that_are_not_its_answer`).
+
+**Open questions for the maintainer.**
+1. **Which request should the probe send?** As built it reads fault memory with mask `FF`, so one sweep also collects every module's faults. An alternative is one standard identification identifier per address, which is a shorter reply and says nothing about faults. (Either is on the read list.)
+2. **Should probe results be logged to the garage** as fault snapshots, as DR-0002 Q2 answers for MCP reads? (Not built. It needs the operations-to-garage wiring.)
+3. **Is the risk in A1.1's assumption accepted** before the ISO clause check, or should the first probe of a real car wait for that check?
