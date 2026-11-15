@@ -1,101 +1,176 @@
 //! High-level diagnostic operations shared by the CLI and (next) the MCP server.
 
-use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 pub use diagwire_hsfz as hsfz;
 pub use diagwire_uds as uds;
 
-/// Functional address the F/G-series gateway fans out to every ECU.
-pub const FUNCTIONAL_ALL: u8 = 0xDF;
+#[cfg(test)]
+mod tests;
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to wait after each "response pending" (UDS P2* time).
-const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+/// The time limits of one operation (DR-0001 D10). Every value is chosen or
+/// carried over from the spike; none is checked against an authority yet.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// From the start of the operation: the request written and acked.
+    ack: Duration,
+    /// Wait for the first response.
+    response: Duration,
+    /// Wait after each "response pending" (UDS P2*).
+    pending: Duration,
+    /// The whole operation. Fixed when it starts; nothing extends it.
+    operation: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            ack: Duration::from_secs(2),
+            response: Duration::from_secs(2),
+            pending: Duration::from_secs(5),
+            operation: Duration::from_secs(30),
+        }
+    }
+}
+
+/// How one single-ECU operation ended (DR-0001 D10). Only `Complete` carries
+/// a result: every other outcome means the answer is unknown, never "nothing
+/// to report".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome<T> {
+    Complete(T),
+    /// The ECU refused the request with this negative response code.
+    Negative(u8),
+    /// The ECU said "response pending" and no final reply arrived in time.
+    PendingExpired,
+    /// Nothing that counts as a response arrived in time.
+    NoResponse,
+    /// Something arrived that could not be validated. Nothing is salvaged
+    /// from it.
+    Malformed,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     Transport(#[from] hsfz::Error),
-    #[error(transparent)]
-    Decode(#[from] uds::DecodeError),
-    #[error("ECU 0x{ecu:02X} refused service 0x{service:02X}: {} (NRC 0x{nrc:02X})", uds::nrc_name(*nrc))]
-    Negative { ecu: u8, service: u8, nrc: u8 },
-    #[error("no response from ECU 0x{0:02X}")]
-    NoResponse(u8),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Session {
-    conn: hsfz::Connection,
+/// One connection to a vehicle. After any outcome other than `Complete` or
+/// `Negative` the connection is closed and the session is finished: every
+/// later call fails with [`hsfz::Error::Disposed`].
+pub struct Session<S = TcpStream> {
+    conn: hsfz::Connection<S>,
+    timing: Timing,
 }
 
-impl Session {
+impl Session<TcpStream> {
     pub async fn connect(ip: IpAddr) -> Result<Self> {
         Ok(Self {
             conn: hsfz::Connection::connect(ip).await?,
+            timing: Timing::default(),
         })
     }
+}
 
-    /// Sends `request` to one ECU and returns the positive-response body,
-    /// waiting out any "response pending" replies.
-    pub async fn request(&mut self, ecu: u8, request: &[u8]) -> Result<Vec<u8>> {
-        let service = *request.first().expect("UDS request must not be empty");
-        self.conn.send(ecu, request).await?;
-        let mut wait = RESPONSE_TIMEOUT;
-        loop {
-            let Some(msg) = self.conn.recv(wait).await? else {
-                return Err(Error::NoResponse(ecu));
-            };
-            if msg.source != ecu {
-                continue; // a straggler from an earlier functional request
-            }
-            match uds::classify(service, &msg.data)? {
-                uds::Reply::Positive(body) => return Ok(body.to_vec()),
-                uds::Reply::Pending => wait = PENDING_TIMEOUT,
-                uds::Reply::Negative { nrc, .. } => return Err(Error::Negative { ecu, service, nrc }),
-            }
+impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
+    /// Runs a session over an already-open stream. Tests pass a fake here
+    /// (DR-0001 D7).
+    pub fn from_stream(stream: S) -> Self {
+        Self {
+            conn: hsfz::Connection::from_stream(stream),
+            timing: Timing::default(),
         }
     }
 
-    pub async fn read_dtcs(&mut self, ecu: u8, mask: u8) -> Result<uds::DtcReport> {
-        let body = self.request(ecu, &uds::read_dtc_by_status_mask(mask)).await?;
-        Ok(uds::parse_dtc_report(&body)?)
+    /// True once the connection has been closed after a failure.
+    pub fn is_disposed(&self) -> bool {
+        self.conn.is_disposed()
     }
 
-    /// Asks every ECU for its fault memory at once and collects whoever
-    /// answers within `window`. ECUs that stay silent simply don't appear.
-    pub async fn scan_dtcs(&mut self, mask: u8, window: Duration) -> Result<BTreeMap<u8, Result<uds::DtcReport>>> {
-        let request = uds::read_dtc_by_status_mask(mask);
+    /// Reads the fault memory of one ECU.
+    pub async fn read_dtcs(&mut self, ecu: u8, mask: u8) -> Result<Outcome<uds::DtcReport>> {
+        self.transact(ecu, &uds::read_dtc_by_status_mask(mask), uds::parse_dtc_report)
+            .await
+    }
+
+    /// One transaction with one ECU. `decode` validates the body of the
+    /// positive response, and the connection is kept only if it accepts.
+    async fn transact<T>(
+        &mut self,
+        ecu: u8,
+        request: &[u8],
+        decode: impl Fn(&[u8]) -> std::result::Result<T, uds::DecodeError>,
+    ) -> Result<Outcome<T>> {
         let service = request[0];
-        self.conn.send(FUNCTIONAL_ALL, &request).await?;
+        let start = Instant::now();
+        let deadline = start + self.timing.operation;
 
-        let deadline = Instant::now() + window;
-        let mut results = BTreeMap::new();
+        let ack_by = deadline.min(start + self.timing.ack);
+        let mut tx = match self.conn.begin(ecu, request, ack_by).await {
+            Ok(tx) => tx,
+            Err(e) => return failed(ecu, e, false),
+        };
+
+        let mut pending = false;
+        let mut wait = self.timing.response;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
+            let by = deadline.min(Instant::now() + wait);
+            let data = match tx.response(by).await {
+                Ok(data) => data,
+                Err(e) => return failed(ecu, e, pending),
+            };
+            // Returning without `finish` drops the transaction, which closes
+            // the connection.
+            match uds::classify(service, &data) {
+                Ok(uds::Reply::Pending) => {
+                    pending = true;
+                    wait = self.timing.pending;
+                }
+                Ok(uds::Reply::Negative { nrc, .. }) => {
+                    tx.finish();
+                    return Ok(Outcome::Negative(nrc));
+                }
+                Ok(uds::Reply::Positive(body)) => match decode(body) {
+                    Ok(value) => {
+                        tx.finish();
+                        return Ok(Outcome::Complete(value));
+                    }
+                    Err(e) => return Ok(malformed(ecu, &e)),
+                },
+                Err(e) => return Ok(malformed(ecu, &e)),
             }
-            let Some(msg) = self.conn.recv(left).await? else {
-                break;
-            };
-            let result = match uds::classify(service, &msg.data) {
-                Ok(uds::Reply::Positive(body)) => uds::parse_dtc_report(body).map_err(Error::from),
-                Ok(uds::Reply::Pending) => continue,
-                Ok(uds::Reply::Negative { nrc, .. }) => Err(Error::Negative {
-                    ecu: msg.source,
-                    service,
-                    nrc,
-                }),
-                Err(e) => Err(e.into()),
-            };
-            results.insert(msg.source, result);
         }
-        Ok(results)
     }
+}
+
+/// Maps a transport failure onto an outcome. The transport has already
+/// closed the connection.
+fn failed<T>(ecu: u8, error: hsfz::Error, pending: bool) -> Result<Outcome<T>> {
+    match error {
+        hsfz::Error::Timeout(what) => {
+            tracing::warn!(ecu = format!("{ecu:02X}"), "timed out waiting for {what}");
+            Ok(if pending {
+                Outcome::PendingExpired
+            } else {
+                Outcome::NoResponse
+            })
+        }
+        hsfz::Error::Malformed(why) => Ok(malformed(ecu, &why)),
+        other => Err(other.into()),
+    }
+}
+
+fn malformed<T>(ecu: u8, why: &dyn std::fmt::Display) -> Outcome<T> {
+    tracing::warn!(ecu = format!("{ecu:02X}"), "response could not be validated: {why}");
+    Outcome::Malformed
 }
 
 /// Common F/G-series diagnostic addresses. Starting points only, to be

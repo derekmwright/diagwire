@@ -8,13 +8,12 @@
 //! reverse-engineering notes and still need confirming against a capture from
 //! a real car.
 
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -27,7 +26,6 @@ const HEADER_LEN: usize = 6;
 /// Guards against a corrupt length field; real UDS messages are far smaller.
 const MAX_PAYLOAD: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub mod control {
     pub const DIAG: u16 = 0x0001;
@@ -49,6 +47,8 @@ pub enum Error {
     Rejected(u16),
     #[error("malformed frame: {0}")]
     Malformed(&'static str),
+    #[error("the connection was closed after an earlier failure; connect again")]
+    Disposed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -115,95 +115,156 @@ impl DiagMessage {
     }
 }
 
-/// A TCP session with the vehicle gateway.
-pub struct Connection {
-    stream: TcpStream,
-    tester: u8,
+/// The stream and its receive buffer. They live and die together: dropping
+/// this closes the stream and discards every buffered byte.
+struct Io<S> {
+    stream: S,
     rx: Vec<u8>,
-    /// Diagnostic messages that arrived while we were waiting for an ack.
-    pending: VecDeque<DiagMessage>,
 }
 
-impl Connection {
+/// A session with the vehicle gateway that runs one transaction at a time
+/// (DR-0001 D10).
+///
+/// The connection is *disposed of* — its stream closed and its buffer
+/// discarded — after a timeout, a cancelled call, a failed write, a gateway
+/// rejection or malformed framing. Every later call returns
+/// [`Error::Disposed`]; nothing resynchronises. A caller that wants to go on
+/// connects again.
+pub struct Connection<S = TcpStream> {
+    /// `None` while a transaction holds the stream, and for good once the
+    /// connection is disposed of.
+    io: Option<Io<S>>,
+    tester: u8,
+}
+
+impl Connection<TcpStream> {
     pub async fn connect(ip: IpAddr) -> Result<Self> {
         let addr = SocketAddr::new(ip, DIAG_PORT);
         let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| Error::Timeout("TCP connect"))??;
         stream.set_nodelay(true)?;
-        Ok(Self {
-            stream,
+        Ok(Self::from_stream(stream))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
+    /// Wraps an already-open stream. Tests pass a fake here (DR-0001 D7).
+    pub fn from_stream(stream: S) -> Self {
+        Self {
+            io: Some(Io { stream, rx: Vec::new() }),
             tester: TESTER_ADDR,
-            rx: Vec::new(),
-            pending: VecDeque::new(),
-        })
+        }
     }
 
-    /// Sends a UDS request to `target` and waits for the gateway's ack.
-    pub async fn send(&mut self, target: u8, data: &[u8]) -> Result<()> {
-        tracing::debug!(target = format!("{target:02X}"), data = hex(data), "tx");
-        let frame = Frame::diag(self.tester, target, data);
-        self.stream.write_all(&frame.encode()).await?;
+    pub fn is_disposed(&self) -> bool {
+        self.io.is_none()
+    }
 
-        let deadline = Instant::now() + ACK_TIMEOUT;
+    /// Sends a request to `target` and waits for the gateway's ack. `ack_by`
+    /// bounds the write as well as the wait.
+    ///
+    /// The returned [`Transaction`] holds the stream until
+    /// [`Transaction::finish`] hands it back. Any failure here, or dropping
+    /// this future or the transaction early, disposes of the connection.
+    pub async fn begin(&mut self, target: u8, request: &[u8], ack_by: Instant) -> Result<Transaction<'_, S>> {
+        // The stream is taken out for the duration, so every early exit
+        // (error, timeout, a dropped future) closes it without further code.
+        let mut io = self.io.take().ok_or(Error::Disposed)?;
+        tracing::debug!(target = format!("{target:02X}"), data = hex(request), "tx");
+        let frame = Frame::diag(self.tester, target, request).encode();
+        timeout_at(ack_by, io.send(&frame, self.tester))
+            .await
+            .map_err(|_| Error::Timeout("gateway ack"))??;
+        Ok(Transaction {
+            tester: self.tester,
+            conn: self,
+            io: Some(io),
+            target,
+        })
+    }
+}
+
+/// One request that is waiting for its responses. Dropping it without
+/// calling [`Transaction::finish`] disposes of the connection.
+pub struct Transaction<'c, S> {
+    conn: &'c mut Connection<S>,
+    io: Option<Io<S>>,
+    tester: u8,
+    target: u8,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Transaction<'_, S> {
+    /// Returns the next diagnostic message the addressed ECU sent to the
+    /// tester. Messages with any other source or target do not count and are
+    /// skipped. A timeout or any other failure disposes of the connection.
+    pub async fn response(&mut self, by: Instant) -> Result<Vec<u8>> {
+        let mut io = self.io.take().ok_or(Error::Disposed)?;
+        let data = timeout_at(by, io.response(self.target, self.tester))
+            .await
+            .map_err(|_| Error::Timeout("diagnostic response"))??;
+        self.io = Some(io);
+        Ok(data)
+    }
+
+    /// Ends the transaction and returns the stream to the connection. Call
+    /// it only once the final response has arrived and been validated.
+    pub fn finish(mut self) {
+        self.conn.io = self.io.take();
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Io<S> {
+    async fn send(&mut self, frame: &[u8], tester: u8) -> Result<()> {
+        self.stream.write_all(frame).await?;
         loop {
-            let frame = self.read_frame_until(deadline, "gateway ack").await?;
+            let frame = self.read_frame().await?;
             match frame.control {
                 control::ACK => return Ok(()),
-                control::DIAG => self
-                    .pending
-                    .push_back(DiagMessage::from_payload(&frame.payload)?),
-                control::ALIVE_CHECK => self.answer_alive_check().await?,
+                // Nothing is outstanding until our request is acked, so this
+                // cannot be told apart from an answer to something earlier.
+                control::DIAG => return Err(Error::Malformed("diagnostic message before the gateway ack")),
+                control::ALIVE_CHECK => self.answer_alive_check(tester).await?,
                 c if c >= control::FIRST_ERROR => return Err(Error::Rejected(c)),
                 _ => {}
             }
         }
     }
 
-    /// Returns the next diagnostic message, or `None` if none arrives within `wait`.
-    pub async fn recv(&mut self, wait: Duration) -> Result<Option<DiagMessage>> {
-        if let Some(msg) = self.pending.pop_front() {
-            return Ok(Some(msg));
-        }
-        let deadline = Instant::now() + wait;
+    async fn response(&mut self, ecu: u8, tester: u8) -> Result<Vec<u8>> {
         loop {
-            let frame = match self.read_frame_until(deadline, "diagnostic response").await {
-                Ok(frame) => frame,
-                Err(Error::Timeout(_)) => return Ok(None),
-                Err(e) => return Err(e),
-            };
+            let frame = self.read_frame().await?;
             match frame.control {
                 control::DIAG => {
                     let msg = DiagMessage::from_payload(&frame.payload)?;
-                    tracing::debug!(source = format!("{:02X}", msg.source), data = hex(&msg.data), "rx");
-                    return Ok(Some(msg));
+                    tracing::debug!(
+                        source = format!("{:02X}", msg.source),
+                        target = format!("{:02X}", msg.target),
+                        data = hex(&msg.data),
+                        "rx"
+                    );
+                    if msg.source == ecu && msg.target == tester {
+                        return Ok(msg.data);
+                    }
                 }
-                control::ALIVE_CHECK => self.answer_alive_check().await?,
+                control::ALIVE_CHECK => self.answer_alive_check(tester).await?,
                 c if c >= control::FIRST_ERROR => return Err(Error::Rejected(c)),
                 _ => {}
             }
         }
     }
 
-    async fn answer_alive_check(&mut self) -> Result<()> {
+    async fn answer_alive_check(&mut self, tester: u8) -> Result<()> {
         // Unconfirmed format: reply with our tester address so the gateway
         // keeps the session open.
         let reply = Frame {
             control: control::ALIVE_CHECK,
-            payload: vec![0x00, self.tester],
+            payload: vec![0x00, tester],
         };
         self.stream.write_all(&reply.encode()).await?;
         Ok(())
     }
 
-    async fn read_frame_until(&mut self, deadline: Instant, what: &'static str) -> Result<Frame> {
-        timeout_at(deadline, self.read_frame())
-            .await
-            .map_err(|_| Error::Timeout(what))?
-    }
-
-    /// Cancel-safe: bytes are only buffered after `read` completes, so a
-    /// timeout mid-read never loses part of a frame.
     async fn read_frame(&mut self) -> Result<Frame> {
         loop {
             if let Some((frame, used)) = Frame::decode(&self.rx)? {

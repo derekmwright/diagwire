@@ -157,6 +157,8 @@ dependencies = [
  "diagwire-hsfz",
  "diagwire-uds",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

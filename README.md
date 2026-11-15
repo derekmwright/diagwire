@@ -9,15 +9,14 @@ Open-source, cross-platform BMW diagnostics in Rust, built to be driven by an AI
 | `crates/hsfz` | HSFZ transport for F/G-series over an ENET cable: TCP 6801, UDP 6811 discovery |
 | `crates/uds` | UDS (ISO 14229) request builders and response parsers, no I/O |
 | `crates/ds2` | DS2 telegram framing for pre-CAN K-line modules (E36 etc.) |
-| `crates/diagwire` | High-level operations (read faults, scan all ECUs) shared by the front ends |
+| `crates/diagwire` | High-level operations (read one ECU's faults) shared by the front ends |
 | `crates/cli` | `diagwire` command-line tool |
 
 ## Usage
 
 ```
 diagwire discover
-diagwire dtc              # every ECU, via the functional address
-diagwire dtc --ecu 12     # just the DME
+diagwire dtc --ecu 12     # the DME's fault memory
 ```
 
 Set `RUST_LOG=debug` to log every frame in hex.

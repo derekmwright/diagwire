@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use diagwire::{Session, ecu_name, hsfz, uds};
+use diagwire::{Outcome, Session, ecu_name, hsfz, uds};
 use tracing_subscriber::EnvFilter;
 
 /// BMW diagnostics over ENET (F/G-series). Set RUST_LOG=debug to see raw frames.
@@ -21,14 +21,14 @@ enum Cmd {
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
     },
-    /// Read fault memory from one ECU, or from every ECU if --ecu is omitted.
+    /// Read fault memory from one ECU.
     Dtc {
         /// Vehicle IP address. Discovered automatically if omitted.
         #[arg(long)]
         ip: Option<IpAddr>,
         /// ECU diagnostic address in hex, e.g. 12 for the DME.
         #[arg(long, value_parser = parse_hex_u8)]
-        ecu: Option<u8>,
+        ecu: u8,
         /// DTC status mask in hex.
         #[arg(long, value_parser = parse_hex_u8, default_value = "FF")]
         mask: u8,
@@ -60,20 +60,9 @@ async fn main() -> Result<()> {
             let mut session = Session::connect(ip)
                 .await
                 .with_context(|| format!("connecting to {ip}"))?;
-            match ecu {
-                Some(ecu) => print_report(ecu, &session.read_dtcs(ecu, mask).await?),
-                None => {
-                    let results = session.scan_dtcs(mask, Duration::from_secs(5)).await?;
-                    if results.is_empty() {
-                        println!("No ECUs answered.");
-                    }
-                    for (ecu, result) in &results {
-                        match result {
-                            Ok(report) => print_report(*ecu, report),
-                            Err(e) => println!("{}: {e}", label(*ecu)),
-                        }
-                    }
-                }
+            match session.read_dtcs(ecu, mask).await? {
+                Outcome::Complete(report) => print_report(ecu, &report),
+                other => bail!("{}: {}; no fault list was read", label(ecu), describe(&other)),
             }
         }
     }
@@ -98,6 +87,17 @@ fn label(ecu: u8) -> String {
     match ecu_name(ecu) {
         Some(name) => format!("0x{ecu:02X} {name}"),
         None => format!("0x{ecu:02X}"),
+    }
+}
+
+/// Says why a read produced no fault list. Never called for `Complete`.
+fn describe<T>(outcome: &Outcome<T>) -> String {
+    match outcome {
+        Outcome::Complete(_) => "read complete".into(),
+        Outcome::Negative(nrc) => format!("refused the read: {} (NRC 0x{nrc:02X})", uds::nrc_name(*nrc)),
+        Outcome::PendingExpired => "said it was still working and never sent a final answer".into(),
+        Outcome::NoResponse => "no response".into(),
+        Outcome::Malformed => "sent a response that could not be validated".into(),
     }
 }
 
