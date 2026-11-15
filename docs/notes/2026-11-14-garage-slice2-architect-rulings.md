@@ -1,0 +1,12 @@
+# Garage slice 2: architect rulings on points DR-0002 leaves open
+
+**Date:** 2026-11-14. **Context:** the slice 2 worker note lists design choices the record does not decide, and code review round 1 (`2026-11-14-garage-slice2-review-r1.md`) returned CHANGES REQUIRED. These rulings fill in implementation detail under the accepted record; none changes a decision line.
+
+1. **A session always belongs to a vehicle (v0).** The reference is resolved in the write transaction (G7). `session.vehicle_id` is NOT NULL, so the schema says what the writer enforces.
+2. **Identity conflict (G7, replay 6) is implemented in this slice.** When a session's reported VIN or chassis disagrees with the resolved vehicle's live VIN or chassis identifier, the session is still written, the conflict is stored on the session row at insert, and every result that carries that session returns the flag. The stored vehicle record is never changed by it. A reported value with no stored counterpart is not a conflict.
+3. **Backup retry is bounded.** If another connection commits between the backup and the migration lock, the backup is retried at most 3 times in total. After that, `open` fails with a distinct error, the garage is unchanged, and no backup from the failed attempts is left behind.
+4. **Backup naming and retention.** Accepted as built: `<garage>.v<from>-<UTC time>.backup`, created exclusively, never overwriting. A backup from a failed or superseded migration is removed. A backup from a successful migration is kept and never pruned in v0.
+5. **"Newest" means write order** (row id), not timestamp, because the timestamp is taken before the write lock and two connections can commit out of timestamp order. Pinned by a test.
+6. **Accepted as built:** automatic migration on `open`; the `nrc` column; `u8`/`u32`/`u8` for ECU address, DTC code and status; `read_at` from the garage clock.
+
+**Owed by later slices:** capability enforcement in the operations layer (which writer each path holds); the import-side replay 3 test once import exists; `Busy` during migration and a non-UTF-8 garage path are untested.
