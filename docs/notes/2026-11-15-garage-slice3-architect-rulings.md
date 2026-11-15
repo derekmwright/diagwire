@@ -1,0 +1,11 @@
+# Garage slice 3: architect rulings on points DR-0002 leaves open
+
+**Date:** 2026-11-15. **Context:** the slice 3 worker note lists behaviours the record does not spell out, and code review round 1 (`2026-11-15-garage-slice3-review-r1.md`) returned CHANGES REQUIRED. Each ruling was checked against the accepted record's text first; the reviewer found the record silent or consistent on all of them. None may change the accepted record. If one is found to, the record stands and the ruling is withdrawn.
+
+1. **Last live identifier.** Retracting a vehicle's only live identifier is refused. A vehicle with no live identifier could not be referred to, corrected or retracted. To change that identifier, supersede it; to remove the vehicle, retract the vehicle (G5).
+2. **Uniqueness and retracted vehicles.** A retracted vehicle's identifiers do not block another vehicle from holding the same alias or VIN. This follows G5 (a retracted vehicle is out of resolution) and A1 (a replacement vehicle is a new anchor).
+3. **Second vehicle retraction.** It returns the not-found outcome and adds no row, because no reference resolves to a retracted vehicle (G7). The UNIQUE constraint is the storage backstop.
+4. **History after a vehicle is retracted.** G5 says a retraction hides its target from default queries and keeps it in history. So the measurements of a retracted vehicle must stay readable: a history read by the vehicle's immutable id returns its sessions and fault snapshots with provenance, as it does its records.
+5. **Finishing a session on a retracted vehicle.** A session started before the retraction may still record its fault reads. A measurement is what the car reported, and discarding it would lose evidence. No new session can start for a retracted vehicle, because its reference no longer resolves. Such snapshots appear in the history read of ruling 4 and in no default query.
+
+**Accepted as built:** a superseding identifier keeps its target's kind; `note.about_date` is required and defaults to the clock's local date; a vehicle retraction requires a reason; finality for notes and identifiers is enforced in the API, as slice 1 did for service events.
