@@ -23,3 +23,10 @@ Each entry is decided, not abandoned: it gives the reason it's paused and the co
 **Parked because:** a GUI is out of v0 in DR-0001 and DR-0002, and it would be a third record while two are in flight.
 **Resume when:** DR-0002 (garage) is accepted and its first slice has landed, so the app has real data to show.
 **Known constraint:** 3D models carry their own licenses (Sketchfab models range from CC-BY to store purchases with no redistribution), and they depict BMW vehicles. Don't bundle any model whose license doesn't permit redistribution. The likely design is user-supplied glTF models from a local folder, with a generic fallback model we ship.
+
+## Coding: adapting a car to replacement parts
+
+**Idea (maintainer, 2026-11-15):** support coding, so that an older car can be adapted when original parts are no longer available and aftermarket ones are fitted. Headlights are the example given.
+**Parked because:** DR-0001 lists coding as out of v0, and v0 is read-only (Q4). Coding changes vehicle state, and the governing rule requires the maintainer's explicit consent for each such action. The approval mechanism that an AI cannot forge is DR-0004's subject and does not exist yet.
+**Resume when:** DR-0004 (clear-faults and battery registration, with the approval mechanism) is accepted and its first slice has landed. Coding then gets its own design record.
+**Known requirements:** reading a module's coding data is a read and can come first, through the read-only probe (DR-0001 amendment A1, a draft); a full backup of the module's coding is read, stored and verified before any write; every write is approved per action, bound to the vehicle, module and exact data, and read back afterwards; what each coding value means needs an authority, as any other definition does (D5), and nothing is copied from BMW's data (D8); whether coding a given module needs security access, and what that means legally and technically, is unverified and must be settled in the record before any code; a failed or wrong write can leave a module unusable, so the record must say how a write is undone.
