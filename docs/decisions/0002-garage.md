@@ -57,7 +57,7 @@ The garage records what was observed and what was done, with where each fact cam
   - *Alternatives:* No AI writes (loses the main use). Per-write confirmation (no forge-proof channel yet, DR-0003). Vehicle management CLI-only (rejected by ruling 2).
   - *Reopen if:* MCP gains a standard human-approval primitive.
 
-- **G7 Vehicle identity:** the VIN is the key when known, and maintainer-defined aliases ("03 E46", "the M3", "son's E90") resolve to it. If a reference matches more than one vehicle, the AI must ask and must not write. If discovery reports a known VIN with data that conflicts with the stored record, the conflict is recorded and flagged; the stored record is never silently overwritten.
+- **G7 Vehicle identity:** the VIN is the key when known, and user-defined aliases ("03 E46", "the M3", "the wagon") resolve to it. If a reference matches more than one vehicle, the AI must ask and must not write. If discovery reports a known VIN with data that conflicts with the stored record, the conflict is recorded and flagged; the stored record is never silently overwritten.
   - *Reason:* A VIN is unique but not always known (no cable, older cars). People name cars by nickname.
   - *Consequence:* Resolution normalises the reference (trim, case-fold, collapse spaces) and collects the distinct vehicles with a live identifier (label, alias, VIN or chassis) equal to it: one → `Resolved`; several → `Ambiguous(candidates)`; none → `NotFound`. No fuzzy matching. Every write about an existing vehicle takes a reference and resolves it in the same `BEGIN IMMEDIATE` transaction as the insert, so a concurrent addition cannot slip past. `Ambiguous` and `NotFound` write nothing. Residual: the garage refuses ambiguous references it receives; it cannot stop a model from choosing one alias itself. The G6 echo is the mitigation. A discovery conflict is stored on the session and returned flagged; the vehicle's identifiers are unchanged.
   - *Alternatives:* VIN-only (unusable without a cable). Most-recently-used match (silently wrong on replay 1).
@@ -158,7 +158,7 @@ Stop conditions: the bundled build fails on Windows or Linux; test 5's version e
 
 ## Open questions for the maintainer (answerable in one line; cost given)
 
-1. **Note import:** ship a general import feature (any user can bring in prior notes or records, labelled `imported-note`), which we then use for our own five cars? (Per G0 it's a product feature, not a one-off script.) **Answered (maintainer, 2026-11-14): yes**, a general import feature, always labelled `imported-note`.
+1. **Note import:** ship a general import feature (any user can bring in prior notes or records, labelled `imported-note`), which we then use for our own cars? (Per G0 it's a product feature, not a one-off script.) **Answered (maintainer, 2026-11-14): yes**, a general import feature, always labelled `imported-note`.
 2. **Automatic session logging:** store every MCP read as a snapshot automatically, or only when asked? (Automatic makes "what's new since last time" work with no extra step.) **Answered (maintainer, 2026-11-14): automatic.**
 3. **Odometer unit:** miles only (US fleet), or a unit per record? (Per-record costs one column and supports any car later.) **Answered (maintainer, 2026-11-14): a unit per record** (as G10 already states).
 4. **Garage location:** default OS data directory, or a path you choose? (Either way it can be overridden.) **Answered (maintainer, 2026-11-14): the user's local app-data directory**, per OS (G1).
