@@ -93,7 +93,16 @@ Each ran in a scratch copy with its own new target directory: `cargo test -p dia
 | Control | Guarded line broken | Result |
 |---|---|---|
 | nc1 | the request is written outside the ack timeout | no assertion failed; the run hung and was stopped at 240 s (exit 124). Expected: `blocked_write_is_bounded_by_the_deadline` has no timer left to end it |
-| nc2 to nc8 | connection kept after a timeout; source filter and target filter each removed; pending wait not capped by the deadline; message before the ack skipped; connection kept after an invalid reply; subfunction check removed; ack wait not capped at 2 s | **still running when this note was committed. Results follow in an update to this note.** |
+| nc2 | connection kept after a response timeout | 8 tests failed, among them `silence_after_the_ack_is_no_response`, `pending_then_silence_is_pending_expired` and `deadline_inside_a_split_frame_closes_the_connection`; the run then hung and was stopped at 240 s (exit 124) |
+| nc3 | target filter removed (source only) | `replies_from_or_to_anyone_else_do_not_count`: `left: Complete(DtcReport { … })` `right: NoResponse` |
+| nc3b | source filter removed (target only) | the same test and message |
+| nc4 | pending wait not capped by the operation deadline | no assertion failed; the run hung and was stopped at 240 s (exit 124). Expected: `endless_pending_stops_at_the_operation_deadline` never ends |
+| nc5 | a diagnostic message before the ack is skipped | `diagnostic_message_before_the_ack_is_malformed` and `leftover_reply_never_answers_the_next_request`: `left: NoResponse` `right: Malformed` |
+| nc6 | connection kept after an invalid reply | `invalid_responses_are_malformed_and_close`: `assertion failed: session.is_disposed()` |
+| nc7 | subfunction check removed from `uds::parse_dtc_report` | `invalid_responses_are_malformed_and_close`: `another subfunction echoed` `left: Complete(DtcReport { availability_mask: 255, dtcs: [] })` `right: Malformed` |
+| nc8 | ack wait not capped at 2 s | `blocked_write_is_bounded_by_the_deadline`: `left: 30s` `right: 2s`; also `missing_ack_is_no_response_and_closes` |
+
+The controls ran on the working tree before it was committed, at different moments of the session; the `diagwire` and `hsfz` transaction code did not change between them and `2f46f7e`. nc1 and nc4 show a hang, not a named failing test.
 
 ## Gate results
 
