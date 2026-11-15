@@ -15,6 +15,13 @@ use crate::{Clock, Error, Garage, REVISION, Result};
 /// one.
 const OBSERVATION_SOURCE: Source = Source::DiagwireRead;
 
+macro_rules! session_cols {
+    () => {
+        "s.id, s.vehicle_id, s.reported_vin, s.reported_chassis, \
+         s.source, s.recorded_at, s.diagwire_rev, s.vin_conflict, s.chassis_conflict"
+    };
+}
+
 macro_rules! snapshot_cols {
     () => {
         "f.id, f.session_id, f.ecu_address, f.outcome, f.nrc, f.read_at, \
@@ -130,6 +137,14 @@ pub struct EcuFaults {
     pub newer_attempts: Vec<FaultSnapshot>,
 }
 
+/// One session and every fault read taken in it, oldest first. Each part
+/// carries its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHistory {
+    pub session: Session,
+    pub fault_reads: Vec<FaultSnapshot>,
+}
+
 /// Adds sessions and fault snapshots. Every write is one `BEGIN IMMEDIATE`
 /// transaction.
 pub struct ObservationWriter<'g> {
@@ -184,23 +199,13 @@ impl<'g> ObservationWriter<'g> {
             ],
         )?;
         let session = tx.query_row(
-            "SELECT id, vehicle_id, reported_vin, reported_chassis,
-                    source, recorded_at, diagwire_rev, vin_conflict, chassis_conflict
-             FROM session WHERE id = ?1",
+            concat!(
+                "SELECT ",
+                session_cols!(),
+                " FROM session s WHERE s.id = ?1"
+            ),
             [tx.last_insert_rowid()],
-            |r| {
-                Ok(Session {
-                    id: r.get(0)?,
-                    vehicle_id: r.get(1)?,
-                    reported_vin: r.get(2)?,
-                    reported_chassis: r.get(3)?,
-                    identity_conflict: IdentityConflict {
-                        vin: r.get(7)?,
-                        chassis: r.get(8)?,
-                    },
-                    provenance: provenance_from_row(r, 4)?,
-                })
-            },
+            session_from_row,
         )?;
         tx.commit()?;
         Ok(Outcome::Resolved(session))
@@ -209,7 +214,9 @@ impl<'g> ObservationWriter<'g> {
     /// Stores one read attempt of the ECU at `ecu_address`, taken in
     /// `session_id`. The snapshot and its fault rows are one transaction:
     /// either all of it is stored or none. A failed read stores its failure
-    /// kind and no faults.
+    /// kind and no faults. Refused, with nothing written, if the session's
+    /// vehicle has been retracted: a retracted vehicle takes no more writes
+    /// (G7). A session bound to no vehicle is not affected.
     pub fn record_fault_read(
         &mut self,
         session_id: i64,
@@ -227,6 +234,16 @@ impl<'g> ObservationWriter<'g> {
         )?;
         if !known {
             return Err(Error::SessionNotFound(session_id));
+        }
+        let retracted: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM session s
+                JOIN vehicle_retraction r ON r.vehicle_id = s.vehicle_id
+               WHERE s.id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if retracted {
+            return Err(Error::VehicleRetracted(session_id));
         }
         tx.execute(
             "INSERT INTO fault_snapshot (session_id, ecu_address, outcome, nrc, read_at)
@@ -307,6 +324,71 @@ impl Garage {
         }
         Ok(Outcome::Resolved(ecus))
     }
+}
+
+/// Reads by the vehicle's immutable id, for history.
+impl Garage {
+    /// Every session of the vehicle with id `vehicle_id` and every fault
+    /// read taken in each, in the order they were written, whether or not
+    /// the vehicle has been retracted. The id is the one
+    /// [`Garage::vehicle_history`] and [`Garage::vehicles`] return. This is
+    /// history, not the latest state: for that, and for a vehicle named by
+    /// reference, use [`Garage::latest_measured_faults`].
+    pub fn observation_history(&self, vehicle_id: i64) -> Result<Vec<SessionHistory>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let known: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM vehicle WHERE id = ?1)",
+            [vehicle_id],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(Error::VehicleNotFound(vehicle_id));
+        }
+        let sessions = tx
+            .prepare(concat!(
+                "SELECT ",
+                session_cols!(),
+                " FROM session s WHERE s.vehicle_id = ?1 ORDER BY s.id"
+            ))?
+            .query_map([vehicle_id], session_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut reads = tx.prepare(concat!(
+            "SELECT ",
+            snapshot_cols!(),
+            " FROM fault_snapshot f JOIN session s ON s.id = f.session_id
+              WHERE f.session_id = ?1 ORDER BY f.id"
+        ))?;
+        sessions
+            .into_iter()
+            .map(|session| {
+                let stored = reads
+                    .query_map([session.id], stored_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let fault_reads = stored
+                    .into_iter()
+                    .map(|s| s.load(&tx))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(SessionHistory {
+                    session,
+                    fault_reads,
+                })
+            })
+            .collect()
+    }
+}
+
+fn session_from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get(0)?,
+        vehicle_id: r.get(1)?,
+        reported_vin: r.get(2)?,
+        reported_chassis: r.get(3)?,
+        identity_conflict: IdentityConflict {
+            vin: r.get(7)?,
+            chassis: r.get(8)?,
+        },
+        provenance: provenance_from_row(r, 4)?,
+    })
 }
 
 /// A `fault_snapshot` row before its fault rows are read.

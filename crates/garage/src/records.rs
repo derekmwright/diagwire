@@ -1,5 +1,7 @@
 //! Maintainer records: vehicles, identifiers and service events. Inserts
-//! only; a correction supersedes, a mistake is retracted (G5).
+//! only; a correction supersedes, a mistake is retracted (G5). Notes are in
+//! `notes.rs`; identifier corrections and vehicle retraction in
+//! `corrections.rs`.
 
 use std::fmt;
 
@@ -27,12 +29,26 @@ macro_rules! live {
     };
 }
 
+/// An identifier counts for resolution and for uniqueness when its row is
+/// live and its vehicle has not been retracted (G5).
+macro_rules! live_ident {
+    ($a:literal) => {
+        concat!(
+            live!("vehicle_ident", $a),
+            " AND NOT EXISTS (SELECT 1 FROM vehicle_retraction vr WHERE vr.vehicle_id = ",
+            $a,
+            ".vehicle_id)"
+        )
+    };
+}
+
 macro_rules! ident_cols {
     () => {
         "i.id, i.vehicle_id, i.kind, i.value, i.supersedes_id, i.retracted, \
          i.source, i.recorded_at, i.diagwire_rev"
     };
 }
+pub(crate) use {ident_cols, live};
 
 macro_rules! event_cols {
     () => {
@@ -221,13 +237,14 @@ pub(crate) fn normalize(s: &str) -> String {
 /// Adds maintainer records. Every write is one `BEGIN IMMEDIATE`
 /// transaction, which resolves its reference before inserting.
 pub struct RecordWriter<'g> {
-    conn: &'g mut Connection,
-    clock: &'g dyn Clock,
+    pub(crate) conn: &'g mut Connection,
+    pub(crate) clock: &'g dyn Clock,
 }
 
-struct Stamp {
-    source: String,
-    recorded_at: String,
+/// The provenance a [`RecordWriter`] puts on the rows of one write.
+pub(crate) struct Stamp {
+    pub(crate) source: String,
+    pub(crate) recorded_at: String,
 }
 
 impl<'g> RecordWriter<'g> {
@@ -235,7 +252,7 @@ impl<'g> RecordWriter<'g> {
         Self { conn, clock }
     }
 
-    fn stamp(&self) -> Stamp {
+    pub(crate) fn stamp(&self) -> Stamp {
         Stamp {
             source: RECORD_SOURCE.as_str().into_owned(),
             recorded_at: format_timestamp(self.clock.now()),
@@ -253,7 +270,7 @@ impl<'g> RecordWriter<'g> {
             params![stamp.source, stamp.recorded_at, REVISION],
         )?;
         let vehicle_id = tx.last_insert_rowid();
-        insert_ident(&tx, &stamp, vehicle_id, IdentKind::Label, label)?;
+        insert_ident(&tx, &stamp, vehicle_id, IdentKind::Label, label, None)?;
         let vehicle = load_vehicle(&tx, vehicle_id)?;
         tx.commit()?;
         Ok(vehicle)
@@ -276,16 +293,8 @@ impl<'g> RecordWriter<'g> {
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
-        let id = insert_ident(&tx, &stamp, vehicle_id, kind, value)?;
-        let ident = tx.query_row(
-            concat!(
-                "SELECT ",
-                ident_cols!(),
-                " FROM vehicle_ident i WHERE i.id = ?1"
-            ),
-            [id],
-            ident_from_row,
-        )?;
+        let id = insert_ident(&tx, &stamp, vehicle_id, kind, value, None)?;
+        let ident = load_ident(&tx, id)?;
         tx.commit()?;
         Ok(Outcome::Resolved(ident))
     }
@@ -421,14 +430,7 @@ impl Garage {
 
     /// Every service event row, including superseded rows and retractions.
     pub fn service_event_history(&self, reference: &str) -> Result<Outcome<Vec<ServiceEvent>>> {
-        self.events(
-            reference,
-            concat!(
-                "SELECT ",
-                event_cols!(),
-                " FROM service_event e WHERE e.vehicle_id = ?1 ORDER BY e.id"
-            ),
-        )
+        self.events(reference, EVENT_HISTORY_SQL)
     }
 
     fn events(&self, reference: &str, sql: &str) -> Result<Outcome<Vec<ServiceEvent>>> {
@@ -438,24 +440,40 @@ impl Garage {
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
-        let label = live_label(&tx, vehicle_id)?;
-        let mut stmt = tx.prepare(sql)?;
-        let events = stmt
-            .query_map([vehicle_id], |r| event_from_row(r, label.clone()))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(Outcome::Resolved(events))
+        Ok(Outcome::Resolved(event_rows(&tx, vehicle_id, sql)?))
     }
 }
 
+const EVENT_HISTORY_SQL: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM service_event e WHERE e.vehicle_id = ?1 ORDER BY e.id"
+);
+
+/// Every service event row of one vehicle, by id.
+pub(crate) fn event_history(conn: &Connection, vehicle_id: i64) -> Result<Vec<ServiceEvent>> {
+    event_rows(conn, vehicle_id, EVENT_HISTORY_SQL)
+}
+
+fn event_rows(conn: &Connection, vehicle_id: i64, sql: &str) -> Result<Vec<ServiceEvent>> {
+    let label = live_label(conn, vehicle_id)?;
+    let mut stmt = conn.prepare(sql)?;
+    let events = stmt
+        .query_map([vehicle_id], |r| event_from_row(r, label.clone()))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
 /// Distinct vehicles with a live identifier equal to the normalised
-/// reference: one resolves, several are ambiguous, none is not found.
+/// reference: one resolves, several are ambiguous, none is not found. A
+/// retracted vehicle's identifiers match nothing (G5).
 pub(crate) fn resolve(conn: &Connection, reference: &str) -> Result<Resolution> {
     let norm = normalize(reference);
     let mut stmt = conn.prepare(concat!(
         "SELECT ",
         ident_cols!(),
         " FROM vehicle_ident i WHERE i.value_norm = ?1 AND ",
-        live!("vehicle_ident", "i"),
+        live_ident!("i"),
         " ORDER BY i.vehicle_id, i.id"
     ))?;
     let matches = stmt
@@ -486,7 +504,10 @@ fn vehicle_ref(conn: &Connection, first: Identifier) -> Result<VehicleRef> {
     })
 }
 
-fn vehicle_provenance(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Provenance> {
+pub(crate) fn vehicle_provenance(
+    conn: &Connection,
+    vehicle_id: i64,
+) -> rusqlite::Result<Provenance> {
     conn.query_row(
         "SELECT source, recorded_at, diagwire_rev FROM vehicle WHERE id = ?1",
         [vehicle_id],
@@ -494,12 +515,18 @@ fn vehicle_provenance(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Pr
     )
 }
 
-fn insert_ident(
+/// Inserts a live identifier on `vehicle_id`: a new one, or with
+/// `supersedes` the head that corrects that row. Refused if it equals a
+/// live alias or VIN of another vehicle that has not been retracted. Call
+/// it inside the write transaction, so the check and the insert see the
+/// same rows (G6).
+pub(crate) fn insert_ident(
     conn: &Connection,
     stamp: &Stamp,
     vehicle_id: i64,
     kind: IdentKind,
     value: &str,
+    supersedes: Option<i64>,
 ) -> Result<i64> {
     let value = value.trim();
     let norm = normalize(value);
@@ -510,7 +537,7 @@ fn insert_ident(
         concat!(
             "SELECT EXISTS (SELECT 1 FROM vehicle_ident i WHERE i.value_norm = ?1
                  AND i.vehicle_id <> ?2 AND i.kind IN ('alias', 'vin') AND ",
-            live!("vehicle_ident", "i"),
+            live_ident!("i"),
             ")"
         ),
         params![norm, vehicle_id],
@@ -520,17 +547,74 @@ fn insert_ident(
         return Err(Error::IdentifierTaken(kind));
     }
     conn.execute(
-        "INSERT INTO vehicle_ident (vehicle_id, kind, value, value_norm, source, recorded_at, diagwire_rev)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![vehicle_id, kind.as_str(), value, norm, stamp.source, stamp.recorded_at, REVISION],
+        "INSERT INTO vehicle_ident (vehicle_id, kind, value, value_norm, supersedes_id,
+             source, recorded_at, diagwire_rev)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            vehicle_id,
+            kind.as_str(),
+            value,
+            norm,
+            supersedes,
+            stamp.source,
+            stamp.recorded_at,
+            REVISION
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+pub(crate) fn load_ident(conn: &Connection, id: i64) -> rusqlite::Result<Identifier> {
+    conn.query_row(
+        concat!(
+            "SELECT ",
+            ident_cols!(),
+            " FROM vehicle_ident i WHERE i.id = ?1"
+        ),
+        [id],
+        ident_from_row,
+    )
+}
+
+/// Checks that row `target` of the chain-bearing `table` can be corrected:
+/// it is on this vehicle and nothing supersedes it yet. A retraction is
+/// final (DR-0002 A1): a retracted head can be neither superseded nor
+/// retracted again; it is undone with a fresh record.
+pub(crate) fn check_correctable(
+    conn: &Connection,
+    table: &'static str,
+    vehicle_id: i64,
+    target: i64,
+    retracting: bool,
+) -> Result<()> {
+    let retracted: bool = conn
+        .query_row(
+            &format!("SELECT retracted FROM {table} WHERE id = ?1 AND vehicle_id = ?2"),
+            [target, vehicle_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or(Error::RecordNotFound(target))?;
+    let superseded: bool = conn.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE supersedes_id = ?1)"),
+        [target],
+        |r| r.get(0),
+    )?;
+    if superseded {
+        return Err(Error::AlreadySuperseded(target));
+    }
+    match (retracted, retracting) {
+        (false, _) => Ok(()),
+        (true, true) => Err(Error::AlreadyRetracted(target)),
+        (true, false) => Err(Error::RetractionIsFinal(target)),
+    }
+}
+
 /// Whether `reported` disagrees with what is stored: the vehicle has a live
 /// identifier of `kind` and none of them equals `reported` once both are
-/// normalised. With no live identifier of that kind there is nothing to
-/// disagree with; a blank `reported` reports nothing.
+/// normalised. Superseded and retracted identifiers are not compared. With
+/// no live identifier of that kind there is nothing to disagree with; a
+/// blank `reported` reports nothing.
 pub(crate) fn live_ident_disagrees(
     conn: &Connection,
     vehicle_id: i64,
@@ -577,8 +661,12 @@ fn head_event(conn: &Connection, vehicle_id: i64, target: i64) -> Result<Service
     Ok(event)
 }
 
-/// The vehicle's newest live label, with its provenance.
-fn live_label(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Option<Identifier>> {
+/// The vehicle's newest live label, with its provenance. A retracted
+/// vehicle keeps its label here, for its history.
+pub(crate) fn live_label(
+    conn: &Connection,
+    vehicle_id: i64,
+) -> rusqlite::Result<Option<Identifier>> {
     conn.query_row(
         concat!(
             "SELECT ",
@@ -593,7 +681,7 @@ fn live_label(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Option<Ide
     .optional()
 }
 
-fn load_vehicle(conn: &Connection, vehicle_id: i64) -> Result<Vehicle> {
+pub(crate) fn load_vehicle(conn: &Connection, vehicle_id: i64) -> Result<Vehicle> {
     let provenance = vehicle_provenance(conn, vehicle_id)?;
     let mut stmt = conn.prepare(concat!(
         "SELECT ",
@@ -627,7 +715,7 @@ fn load_event(conn: &Connection, id: i64) -> Result<ServiceEvent> {
     Ok(event)
 }
 
-fn ident_from_row(r: &Row<'_>) -> rusqlite::Result<Identifier> {
+pub(crate) fn ident_from_row(r: &Row<'_>) -> rusqlite::Result<Identifier> {
     Ok(Identifier {
         id: r.get(0)?,
         vehicle_id: r.get(1)?,

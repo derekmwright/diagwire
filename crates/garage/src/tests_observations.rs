@@ -164,8 +164,8 @@ fn observations_carry_diagwire_read_provenance() {
 }
 
 // Replay 3: nothing the record writer does creates a session or snapshot,
-// so a fault list a maintainer (or an import) reports stays a record and is
-// never returned as a measurement.
+// so a fault list a maintainer (or an import) reports stays a record (a
+// service event or a note) and is never returned as a measurement.
 #[test]
 fn replay3_record_writer_creates_no_observation() {
     let (_dir, _path, mut g) = new_garage();
@@ -185,6 +185,23 @@ fn replay3_record_writer_creates_no_observation() {
             .unwrap(),
     );
     resolved(w.retract_service_event("shop car", second.id).unwrap());
+    // Slice 3: the same fault list as a note, and the other record writes.
+    let said = NoteInput {
+        about_date: None,
+        body: "Previous owner said faults 2A82 and 2A87 were stored".into(),
+    };
+    let note = resolved(w.add_note("shop car", &said).unwrap());
+    let note = resolved(w.supersede_note("shop car", note.id, &said).unwrap());
+    resolved(w.retract_note("shop car", note.id).unwrap());
+    let alias = resolved(
+        w.add_identifier("shop car", IdentKind::Alias, "the spare")
+            .unwrap(),
+    );
+    let alias = resolved(
+        w.supersede_identifier("shop car", alias.id, "the runabout")
+            .unwrap(),
+    );
+    resolved(w.retract_identifier("shop car", alias.id).unwrap());
 
     assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
     assert_eq!(
@@ -192,21 +209,33 @@ fn replay3_record_writer_creates_no_observation() {
         Outcome::Resolved(vec![]),
         "nothing was measured on this vehicle"
     );
+    resolved(
+        g.record_writer()
+            .retract_vehicle("the loaner", "Returned")
+            .unwrap(),
+    );
+    assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
 }
 
 // Replay 3, structurally: `RecordWriter` and everything it calls live in
-// `records.rs`, which names no observation table and no observation code.
+// `records.rs`, `notes.rs` and `corrections.rs`, which name no observation
+// table and no observation code.
 #[test]
 fn replay3_record_writer_source_names_no_observation_table() {
-    let records = include_str!("records.rs");
-    for word in [
-        "session",
-        "fault_snapshot",
-        "fault_dtc",
-        "observations",
-        "ObservationWriter",
+    for (file, text) in [
+        ("records.rs", include_str!("records.rs")),
+        ("notes.rs", include_str!("notes.rs")),
+        ("corrections.rs", include_str!("corrections.rs")),
     ] {
-        assert!(!records.contains(word), "records.rs mentions {word}");
+        for word in [
+            "session",
+            "fault_snapshot",
+            "fault_dtc",
+            "observations",
+            "ObservationWriter",
+        ] {
+            assert!(!text.contains(word), "{file} mentions {word}");
+        }
     }
 }
 
@@ -671,5 +700,289 @@ fn newest_is_write_order_not_timestamp_order() {
             latest_complete: Some(last),
             newer_attempts: vec![],
         }])
+    );
+}
+
+// Slice 3: the comparison uses live identifiers only. A superseded or
+// retracted VIN or chassis is not compared, so reporting the old value is a
+// conflict and a vehicle whose only identifier of a kind was retracted has
+// nothing to disagree with.
+#[test]
+fn identity_conflict_ignores_superseded_and_retracted_identifiers() {
+    let (_dir, _path, mut g) = new_garage();
+    let mut w = g.record_writer();
+    w.add_vehicle("Known car").unwrap();
+    let vin_a = resolved(
+        w.add_identifier("known car", IdentKind::Vin, "TESTVIN0000000001")
+            .unwrap(),
+    );
+    let chassis = resolved(
+        w.add_identifier("known car", IdentKind::Chassis, "E46")
+            .unwrap(),
+    );
+    let vin_b = resolved(
+        w.supersede_identifier("known car", vin_a.id, "TESTVIN0000000002")
+            .unwrap(),
+    );
+    resolved(w.retract_identifier("known car", chassis.id).unwrap());
+
+    fn flags(g: &mut Garage, vin: Option<&str>, chassis: Option<&str>) -> (bool, bool) {
+        let input = SessionInput {
+            reported_vin: vin.map(Into::into),
+            reported_chassis: chassis.map(Into::into),
+        };
+        let conflict = resolved(
+            g.observation_writer()
+                .start_session("known car", &input)
+                .unwrap(),
+        )
+        .identity_conflict;
+        (conflict.vin, conflict.chassis)
+    }
+    // The superseded VIN is no longer the stored one.
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000001"), None),
+        (true, false)
+    );
+    assert_eq!(
+        flags(&mut g, Some("testvin0000000002"), None),
+        (false, false)
+    );
+    // The only chassis was retracted: nothing stored to disagree with,
+    // whether the report differs from the retracted value or equals it.
+    assert_eq!(flags(&mut g, None, Some("E90")), (false, false));
+    assert_eq!(flags(&mut g, None, Some("E46")), (false, false));
+
+    // With the VIN retracted too, no VIN is stored.
+    resolved(
+        g.record_writer()
+            .retract_identifier("known car", vin_b.id)
+            .unwrap(),
+    );
+    assert_eq!(
+        (
+            flags(&mut g, Some("TESTVIN0000000001"), None),
+            flags(&mut g, Some("TESTVIN0000000002"), None),
+        ),
+        ((false, false), (false, false))
+    );
+    // A fresh VIN is compared; the retracted one is not.
+    resolved(
+        g.record_writer()
+            .add_identifier("known car", IdentKind::Vin, "TESTVIN0000000003")
+            .unwrap(),
+    );
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000002"), None),
+        (true, false)
+    );
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000003"), None),
+        (false, false)
+    );
+}
+
+/// A vehicle labelled "Test car" (alias "the tester", chassis E46) with one
+/// session holding a complete read with a fault and a failed read, and a
+/// second vehicle "Other car" (chassis E46) with one session and one read.
+fn two_measured_vehicles() -> (
+    tempfile::TempDir,
+    Garage,
+    Vehicle,
+    Vehicle,
+    Session,
+    Session,
+) {
+    let (dir, _path, mut g) = new_garage();
+    let car = g.record_writer().add_vehicle("Test car").unwrap();
+    let other = g.record_writer().add_vehicle("Other car").unwrap();
+    let mut w = g.record_writer();
+    resolved(
+        w.add_identifier("test car", IdentKind::Alias, "the tester")
+            .unwrap(),
+    );
+    for v in ["test car", "other car"] {
+        resolved(w.add_identifier(v, IdentKind::Chassis, "E46").unwrap());
+    }
+    let session = start(&mut g, "test car");
+    let other_session = start(&mut g, "other car");
+    let mut w = g.observation_writer();
+    w.record_fault_read(
+        session.id,
+        0x12,
+        &FaultRead::Complete(vec![dtc(0x2A82, 0x24)]),
+    )
+    .unwrap();
+    w.record_fault_read(session.id, 0x18, &FaultRead::NoResponse)
+        .unwrap();
+    w.record_fault_read(other_session.id, 0x12, &FaultRead::Complete(vec![]))
+        .unwrap();
+    (dir, g, car, other, session, other_session)
+}
+
+// Slice 3 review round 1, ruling 4: the measurements of a retracted
+// vehicle leave the default query and stay readable, with provenance,
+// through the history read by the vehicle's immutable id.
+#[test]
+fn measurements_of_a_retracted_vehicle_stay_in_history() {
+    let (_dir, mut g, car, other, session, other_session) = two_measured_vehicles();
+
+    // Before the retraction: the default query returns them, and the
+    // history read returns the session and both reads, whole.
+    let latest = resolved(g.latest_measured_faults("the tester").unwrap());
+    assert_eq!(
+        latest.iter().map(|e| e.ecu_address).collect::<Vec<_>>(),
+        [0x12, 0x18]
+    );
+    let complete = latest[0].latest_complete.clone().unwrap();
+    let failed = latest[1].newer_attempts[0].clone();
+    let before = g.observation_history(car.id).unwrap();
+    assert_eq!(
+        before,
+        [SessionHistory {
+            session: session.clone(),
+            fault_reads: vec![complete.clone(), failed.clone()],
+        }]
+    );
+    // Provenance is on every part.
+    assert_eq!(before[0].session.provenance, measured(NOW));
+    assert_eq!(
+        before[0]
+            .fault_reads
+            .iter()
+            .map(|r| (r.read.clone(), r.provenance.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (FaultRead::Complete(vec![dtc(0x2A82, 0x24)]), measured(NOW)),
+            (FaultRead::NoResponse, measured(NOW)),
+        ]
+    );
+
+    resolved(
+        g.record_writer()
+            .retract_vehicle("test car", "Entered twice")
+            .unwrap(),
+    );
+
+    // The default query no longer returns them, under any reference.
+    for reference in ["test car", "the tester"] {
+        assert_eq!(
+            g.latest_measured_faults(reference).unwrap(),
+            Outcome::NotFound,
+            "{reference}"
+        );
+    }
+    // The chassis both vehicles shared now names the other one only, and
+    // its result holds none of the retracted vehicle's reads.
+    let shared = resolved(g.latest_measured_faults("e46").unwrap());
+    assert_eq!(
+        shared,
+        resolved(g.latest_measured_faults("other car").unwrap())
+    );
+    assert!(
+        shared
+            .iter()
+            .flat_map(|e| e.latest_complete.iter().chain(&e.newer_attempts))
+            .all(|s| s.session_id == other_session.id)
+    );
+
+    // The history read still returns them, unchanged, by the id that the
+    // vehicle history gives for the retracted vehicle.
+    let retracted: Vec<i64> = g
+        .vehicle_history()
+        .unwrap()
+        .iter()
+        .filter(|v| v.retraction.is_some())
+        .map(|v| v.id)
+        .collect();
+    assert_eq!(retracted, [car.id]);
+    assert_eq!(g.observation_history(retracted[0]).unwrap(), before);
+
+    // Each vehicle's history is its own; an unknown id is an error, not an
+    // empty history.
+    let others = g.observation_history(other.id).unwrap();
+    assert_eq!(
+        others
+            .iter()
+            .map(|s| (s.session.id, s.fault_reads.len()))
+            .collect::<Vec<_>>(),
+        [(other_session.id, 1)]
+    );
+    assert!(matches!(
+        g.observation_history(9999),
+        Err(Error::VehicleNotFound(9999))
+    ));
+}
+
+// Slice 3 review round 2 (ruling 5 withdrawn; G7): once a vehicle is
+// retracted, a fault read in a session started before the retraction is
+// refused and writes nothing, and no new session can start. The history
+// read is unchanged.
+#[test]
+fn retracted_vehicle_takes_no_fault_read_and_no_new_session() {
+    let (_dir, mut g, car, other, session, other_session) = two_measured_vehicles();
+    let late_read = FaultRead::Complete(vec![dtc(0x2A87, 0x08)]);
+
+    // While the vehicle is live, the session takes this very read.
+    let accepted = g
+        .observation_writer()
+        .record_fault_read(session.id, 0x29, &late_read)
+        .unwrap();
+    assert_eq!(accepted.read, late_read);
+
+    resolved(
+        g.record_writer()
+            .retract_vehicle("test car", "Entered twice")
+            .unwrap(),
+    );
+    let counts = observation_counts(&g.conn);
+    let stored = OBSERVATION_TABLES.map(|t| dump(&g.conn, t));
+    let history = g.observation_history(car.id).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|s| (s.session.id, s.fault_reads.len()))
+            .collect::<Vec<_>>(),
+        [(session.id, 3)]
+    );
+
+    // The same read, and a failed read, in the same session are now
+    // refused: no snapshot row and no fault row is added.
+    for read in [&late_read, &FaultRead::NoResponse] {
+        let result = g
+            .observation_writer()
+            .record_fault_read(session.id, 0x29, read);
+        assert!(
+            matches!(result, Err(Error::VehicleRetracted(id)) if id == session.id),
+            "{read:?}: {result:?}"
+        );
+    }
+    // No new session, under any of the vehicle's references.
+    for reference in ["test car", "the tester"] {
+        assert_eq!(
+            g.observation_writer()
+                .start_session(reference, &SessionInput::default())
+                .unwrap(),
+            Outcome::NotFound,
+            "{reference}"
+        );
+    }
+    assert_eq!(observation_counts(&g.conn), counts);
+    assert_eq!(OBSERVATION_TABLES.map(|t| dump(&g.conn, t)), stored);
+    // The history read is unchanged.
+    assert_eq!(g.observation_history(car.id).unwrap(), history);
+
+    // The refusal is about the retracted vehicle only: the other vehicle's
+    // session still takes a read.
+    let fine = g
+        .observation_writer()
+        .record_fault_read(other_session.id, 0x29, &late_read)
+        .unwrap();
+    assert_eq!(fine.session_id, other_session.id);
+    assert_eq!(
+        g.observation_history(other.id).unwrap()[0]
+            .fault_reads
+            .len(),
+        2
     );
 }
