@@ -339,6 +339,12 @@ impl<'g> RecordWriter<'g> {
             Some(t) => Some(head_event(&tx, vehicle_id, t)?),
             None => None,
         };
+        // A retraction is final (DR-0002 A1): undo it with a fresh record.
+        if let (Some(_), Some(p)) = (input, &previous)
+            && p.retracted
+        {
+            return Err(Error::RetractionIsFinal(p.id));
+        }
         let (date, summary, odometer, retracted) = match (input, &previous) {
             (Some(i), _) => {
                 let summary = i.summary.trim();

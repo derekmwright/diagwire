@@ -302,6 +302,38 @@ fn append_only() {
         [(first.id, false), (second.id, false), (retraction.id, true)]
     );
 
+    // A retraction is final (A1): superseding the retracted head is refused
+    // and writes nothing; a fresh record undoes it, and history keeps the
+    // retraction.
+    let rows = count(&g.conn, "service_event");
+    assert!(matches!(
+        g.record_writer()
+            .supersede_service_event("daily", retraction.id, &oil(None)),
+        Err(Error::RetractionIsFinal(id)) if id == retraction.id
+    ));
+    assert_eq!(count(&g.conn, "service_event"), rows);
+    let fresh = resolved(
+        g.record_writer()
+            .add_service_event("daily", &corrected)
+            .unwrap(),
+    );
+    assert_eq!(fresh.supersedes_id, None);
+    let live = resolved(g.service_events("daily").unwrap());
+    assert_eq!(live.iter().map(|e| e.id).collect::<Vec<_>>(), [fresh.id]);
+    let history = resolved(g.service_event_history("daily").unwrap());
+    assert_eq!(
+        history
+            .iter()
+            .map(|e| (e.id, e.retracted))
+            .collect::<Vec<_>>(),
+        [
+            (first.id, false),
+            (second.id, false),
+            (retraction.id, true),
+            (fresh.id, false)
+        ]
+    );
+
     // A duplicate live alias on another vehicle is refused.
     g.record_writer().add_vehicle("Weekend").unwrap();
     let idents = count(&g.conn, "vehicle_ident");
@@ -319,7 +351,8 @@ fn append_only() {
          VALUES (?1, '2026-01-01', 'x', 1000, 'maintainer-entry', 'now', 'rev')",
         [first.vehicle_id],
     )));
-    assert_eq!(count(&g.conn, "service_event"), before + 1);
+    // `before` plus the retraction and the fresh record.
+    assert_eq!(count(&g.conn, "service_event"), before + 2);
 }
 
 // 4. Replay 4: open refuses a newer, foreign or unrecognised file and leaves

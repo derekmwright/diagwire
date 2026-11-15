@@ -74,6 +74,8 @@ pub enum Error {
     AlreadySuperseded(i64),
     #[error("record {0} is already retracted")]
     AlreadyRetracted(i64),
+    #[error("record {0} is retracted, and a retraction is final; add a new record instead")]
+    RetractionIsFinal(i64),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
