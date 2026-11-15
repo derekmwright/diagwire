@@ -164,8 +164,8 @@ fn observations_carry_diagwire_read_provenance() {
 }
 
 // Replay 3: nothing the record writer does creates a session or snapshot,
-// so a fault list a maintainer (or an import) reports stays a record and is
-// never returned as a measurement.
+// so a fault list a maintainer (or an import) reports stays a record (a
+// service event or a note) and is never returned as a measurement.
 #[test]
 fn replay3_record_writer_creates_no_observation() {
     let (_dir, _path, mut g) = new_garage();
@@ -185,6 +185,23 @@ fn replay3_record_writer_creates_no_observation() {
             .unwrap(),
     );
     resolved(w.retract_service_event("shop car", second.id).unwrap());
+    // Slice 3: the same fault list as a note, and the other record writes.
+    let said = NoteInput {
+        about_date: None,
+        body: "Previous owner said faults 2A82 and 2A87 were stored".into(),
+    };
+    let note = resolved(w.add_note("shop car", &said).unwrap());
+    let note = resolved(w.supersede_note("shop car", note.id, &said).unwrap());
+    resolved(w.retract_note("shop car", note.id).unwrap());
+    let alias = resolved(
+        w.add_identifier("shop car", IdentKind::Alias, "the spare")
+            .unwrap(),
+    );
+    let alias = resolved(
+        w.supersede_identifier("shop car", alias.id, "the runabout")
+            .unwrap(),
+    );
+    resolved(w.retract_identifier("shop car", alias.id).unwrap());
 
     assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
     assert_eq!(
@@ -192,21 +209,33 @@ fn replay3_record_writer_creates_no_observation() {
         Outcome::Resolved(vec![]),
         "nothing was measured on this vehicle"
     );
+    resolved(
+        g.record_writer()
+            .retract_vehicle("the loaner", "Returned")
+            .unwrap(),
+    );
+    assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
 }
 
 // Replay 3, structurally: `RecordWriter` and everything it calls live in
-// `records.rs`, which names no observation table and no observation code.
+// `records.rs`, `notes.rs` and `corrections.rs`, which name no observation
+// table and no observation code.
 #[test]
 fn replay3_record_writer_source_names_no_observation_table() {
-    let records = include_str!("records.rs");
-    for word in [
-        "session",
-        "fault_snapshot",
-        "fault_dtc",
-        "observations",
-        "ObservationWriter",
+    for (file, text) in [
+        ("records.rs", include_str!("records.rs")),
+        ("notes.rs", include_str!("notes.rs")),
+        ("corrections.rs", include_str!("corrections.rs")),
     ] {
-        assert!(!records.contains(word), "records.rs mentions {word}");
+        for word in [
+            "session",
+            "fault_snapshot",
+            "fault_dtc",
+            "observations",
+            "ObservationWriter",
+        ] {
+            assert!(!text.contains(word), "{file} mentions {word}");
+        }
     }
 }
 
@@ -671,5 +700,84 @@ fn newest_is_write_order_not_timestamp_order() {
             latest_complete: Some(last),
             newer_attempts: vec![],
         }])
+    );
+}
+
+// Slice 3: the comparison uses live identifiers only. A superseded or
+// retracted VIN or chassis is not compared, so reporting the old value is a
+// conflict and a vehicle whose only identifier of a kind was retracted has
+// nothing to disagree with.
+#[test]
+fn identity_conflict_ignores_superseded_and_retracted_identifiers() {
+    let (_dir, _path, mut g) = new_garage();
+    let mut w = g.record_writer();
+    w.add_vehicle("Known car").unwrap();
+    let vin_a = resolved(
+        w.add_identifier("known car", IdentKind::Vin, "TESTVIN0000000001")
+            .unwrap(),
+    );
+    let chassis = resolved(
+        w.add_identifier("known car", IdentKind::Chassis, "E46")
+            .unwrap(),
+    );
+    let vin_b = resolved(
+        w.supersede_identifier("known car", vin_a.id, "TESTVIN0000000002")
+            .unwrap(),
+    );
+    resolved(w.retract_identifier("known car", chassis.id).unwrap());
+
+    fn flags(g: &mut Garage, vin: Option<&str>, chassis: Option<&str>) -> (bool, bool) {
+        let input = SessionInput {
+            reported_vin: vin.map(Into::into),
+            reported_chassis: chassis.map(Into::into),
+        };
+        let conflict = resolved(
+            g.observation_writer()
+                .start_session("known car", &input)
+                .unwrap(),
+        )
+        .identity_conflict;
+        (conflict.vin, conflict.chassis)
+    }
+    // The superseded VIN is no longer the stored one.
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000001"), None),
+        (true, false)
+    );
+    assert_eq!(
+        flags(&mut g, Some("testvin0000000002"), None),
+        (false, false)
+    );
+    // The only chassis was retracted: nothing stored to disagree with,
+    // whether the report differs from the retracted value or equals it.
+    assert_eq!(flags(&mut g, None, Some("E90")), (false, false));
+    assert_eq!(flags(&mut g, None, Some("E46")), (false, false));
+
+    // With the VIN retracted too, no VIN is stored.
+    resolved(
+        g.record_writer()
+            .retract_identifier("known car", vin_b.id)
+            .unwrap(),
+    );
+    assert_eq!(
+        (
+            flags(&mut g, Some("TESTVIN0000000001"), None),
+            flags(&mut g, Some("TESTVIN0000000002"), None),
+        ),
+        ((false, false), (false, false))
+    );
+    // A fresh VIN is compared; the retracted one is not.
+    resolved(
+        g.record_writer()
+            .add_identifier("known car", IdentKind::Vin, "TESTVIN0000000003")
+            .unwrap(),
+    );
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000002"), None),
+        (true, false)
+    );
+    assert_eq!(
+        flags(&mut g, Some("TESTVIN0000000003"), None),
+        (false, false)
     );
 }

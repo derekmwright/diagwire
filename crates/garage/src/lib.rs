@@ -1,5 +1,5 @@
-//! The garage: vehicles, their identifiers, service history and measured
-//! faults in one local SQLite file (DR-0002). Synchronous, with no transport
+//! The garage: vehicles, their identifiers, service history, notes and
+//! measured faults in one local SQLite file (DR-0002). Synchronous, with no transport
 //! or car I/O. Callers never see a `rusqlite::Connection` or raw SQL. Writes
 //! go through two capabilities, each of which sets its rows' provenance
 //! itself: [`RecordWriter`] for what the maintainer states, and
@@ -17,6 +17,8 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 mod backup;
 mod clock;
+mod corrections;
+mod notes;
 mod observations;
 mod records;
 mod schema;
@@ -24,11 +26,17 @@ mod schema;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_corrections;
+#[cfg(test)]
 mod tests_migration;
+#[cfg(test)]
+mod tests_notes;
 #[cfg(test)]
 mod tests_observations;
 
 pub use clock::{Clock, SystemClock};
+pub use corrections::{VehicleHistory, VehicleRetraction};
+pub use notes::{Note, NoteInput};
 pub use observations::{
     Dtc, EcuFaults, FaultRead, FaultSnapshot, IdentityConflict, ObservationWriter, Session,
     SessionInput,
@@ -84,6 +92,10 @@ pub enum Error {
     EmptyIdentifier,
     #[error("service event summary is empty")]
     EmptySummary,
+    #[error("note is empty")]
+    EmptyNote,
+    #[error("the reason for retracting a vehicle is empty")]
+    EmptyReason,
     #[error("that {0} already names another vehicle")]
     IdentifierTaken(IdentKind),
     #[error("record {0} not found for this vehicle")]
@@ -94,6 +106,10 @@ pub enum Error {
     AlreadyRetracted(i64),
     #[error("record {0} is retracted, and a retraction is final; add a new record instead")]
     RetractionIsFinal(i64),
+    #[error(
+        "identifier {0} is the last one the vehicle can be referred to by; retract the vehicle instead"
+    )]
+    LastIdentifier(i64),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

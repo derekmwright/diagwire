@@ -11,7 +11,7 @@ pub(crate) struct Migration {
     pub sql: &'static str,
 }
 
-pub(crate) const LATEST: i64 = 2;
+pub(crate) const LATEST: i64 = 3;
 
 /// How many backups one migration takes before giving up, when other
 /// connections keep committing between a backup and the migration's lock.
@@ -25,6 +25,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: V2,
+    },
+    Migration {
+        version: 3,
+        sql: V3,
     },
 ];
 
@@ -261,4 +265,48 @@ BEGIN SELECT RAISE(ABORT, 'garage records are append-only'); END;
 CREATE TRIGGER fault_dtc_only_complete BEFORE INSERT ON fault_dtc
 WHEN (SELECT outcome FROM fault_snapshot WHERE id = NEW.snapshot_id) IS NOT 'complete'
 BEGIN SELECT RAISE(ABORT, 'only a complete read stores faults'); END;
+";
+
+// Notes and vehicle retractions (G5). A note is a chain-bearing record like
+// a service event. A vehicle has no chain, so its retraction is a row of
+// its own, at most one per vehicle. Both carry provenance on the row (G4),
+// limited to record kinds, and are append-only by trigger.
+const V3: &str = "
+CREATE TABLE note (
+    id            INTEGER PRIMARY KEY,
+    vehicle_id    INTEGER NOT NULL REFERENCES vehicle(id),
+    body          TEXT NOT NULL,
+    about_date    TEXT NOT NULL,
+    supersedes_id INTEGER UNIQUE REFERENCES note(id),
+    retracted     INTEGER NOT NULL DEFAULT 0 CHECK (retracted IN (0, 1)),
+    source        TEXT NOT NULL CHECK (source IN ('maintainer-entry', 'imported-note')),
+    recorded_at   TEXT NOT NULL,
+    diagwire_rev  TEXT NOT NULL,
+    CHECK (retracted = 0 OR supersedes_id IS NOT NULL)
+) STRICT;
+CREATE INDEX note_vehicle ON note(vehicle_id);
+
+CREATE TABLE vehicle_retraction (
+    id           INTEGER PRIMARY KEY,
+    vehicle_id   INTEGER NOT NULL UNIQUE REFERENCES vehicle(id),
+    reason       TEXT NOT NULL,
+    source       TEXT NOT NULL CHECK (source IN ('maintainer-entry', 'imported-note')),
+    recorded_at  TEXT NOT NULL,
+    diagwire_rev TEXT NOT NULL
+) STRICT;
+
+CREATE TRIGGER note_no_update BEFORE UPDATE ON note
+BEGIN SELECT RAISE(ABORT, 'garage records are append-only'); END;
+CREATE TRIGGER note_no_delete BEFORE DELETE ON note
+BEGIN SELECT RAISE(ABORT, 'garage records are append-only'); END;
+CREATE TRIGGER vehicle_retraction_no_update BEFORE UPDATE ON vehicle_retraction
+BEGIN SELECT RAISE(ABORT, 'garage records are append-only'); END;
+CREATE TRIGGER vehicle_retraction_no_delete BEFORE DELETE ON vehicle_retraction
+BEGIN SELECT RAISE(ABORT, 'garage records are append-only'); END;
+
+-- A correction stays on its target's vehicle.
+CREATE TRIGGER note_same_vehicle BEFORE INSERT ON note
+WHEN NEW.supersedes_id IS NOT NULL
+ AND (SELECT vehicle_id FROM note WHERE id = NEW.supersedes_id) IS NOT NEW.vehicle_id
+BEGIN SELECT RAISE(ABORT, 'supersede must stay on the same vehicle'); END;
 ";

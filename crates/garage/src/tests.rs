@@ -20,7 +20,7 @@ pub(crate) struct FixedClock;
 
 pub(crate) const NOW: &str = "2026-11-14T03:30:00Z";
 pub(crate) const NOW_STORED: &str = "2026-11-14T03:30:00.000000Z";
-const TODAY: Date = date(2026, 11, 13);
+pub(crate) const TODAY: Date = date(2026, 11, 13);
 
 impl Clock for FixedClock {
     fn now(&self) -> Timestamp {
@@ -71,7 +71,7 @@ pub(crate) fn resolved<T: std::fmt::Debug>(o: Outcome<T>) -> T {
     }
 }
 
-fn label_of(label: &Option<Identifier>) -> Option<&str> {
+pub(crate) fn label_of(label: &Option<Identifier>) -> Option<&str> {
     label.as_ref().map(|l| l.value.as_str())
 }
 
@@ -381,8 +381,8 @@ fn open_refuses_newer_version() {
         matches!(
             e,
             Error::TooNew {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             }
         )
     });
@@ -445,9 +445,9 @@ fn open_missing_creates_nothing_and_create_refuses_existing() {
 #[test]
 fn failed_migration_rolls_back_table_and_version() {
     const FAILING: &[Migration] = &[Migration {
-        version: 3,
+        version: 4,
         sql: "CREATE TABLE probe (x INTEGER);
-              PRAGMA user_version = 3;
+              PRAGMA user_version = 4;
               INSERT INTO no_such_table VALUES (1);",
     }];
     let (_dir, path, mut g) = new_garage();
@@ -464,14 +464,14 @@ fn failed_migration_rolls_back_table_and_version() {
             .unwrap();
         (version, tables)
     };
-    assert_eq!(probe(&g.conn), (2, 0));
+    assert_eq!(probe(&g.conn), (3, 0));
     assert!(matches!(
         schema::migrate(&mut g.conn, FAILING),
         Err(Error::Sqlite(_))
     ));
-    assert_eq!(probe(&g.conn), (2, 0));
+    assert_eq!(probe(&g.conn), (3, 0));
     drop(g);
-    assert_eq!(probe(&Connection::open(&path).unwrap()), (2, 0));
+    assert_eq!(probe(&Connection::open(&path).unwrap()), (3, 0));
 }
 
 // 6. Replay 9: a write that meets another writer's lock fails with Busy at
