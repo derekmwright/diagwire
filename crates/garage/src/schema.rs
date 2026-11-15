@@ -206,13 +206,14 @@ BEGIN SELECT RAISE(ABORT, 'supersede must stay on the same vehicle'); END;
 // Observation tables. A session's `source` is limited to the measured kind
 // this binary writes (backstop to G2's writer split); a snapshot and its
 // DTC rows carry provenance through the NOT NULL link to their session
-// (G4). A session always belongs to a vehicle, and records at insert
-// whether its reported VIN or chassis disagreed with that vehicle's (G7).
+// (G4). A session records at insert whether its reported VIN or chassis
+// disagreed with its vehicle's (G7). `vehicle_id` is nullable for a session
+// bound to no vehicle, which no writer creates yet.
 // `outcome` mirrors DR-0001 D10. Append-only by trigger (G5).
 const V2: &str = "
 CREATE TABLE session (
     id               INTEGER PRIMARY KEY,
-    vehicle_id       INTEGER NOT NULL REFERENCES vehicle(id),
+    vehicle_id       INTEGER REFERENCES vehicle(id),
     reported_vin     TEXT,
     reported_chassis TEXT,
     vin_conflict     INTEGER NOT NULL CHECK (vin_conflict IN (0, 1)),

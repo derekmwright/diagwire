@@ -50,7 +50,9 @@ impl IdentityConflict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub id: i64,
-    pub vehicle_id: i64,
+    /// `None` for a session bound to no vehicle. [`ObservationWriter`]
+    /// creates none; every session it starts has a vehicle.
+    pub vehicle_id: Option<i64>,
     pub reported_vin: Option<String>,
     pub reported_chassis: Option<String>,
     pub identity_conflict: IdentityConflict,

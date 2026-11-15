@@ -65,7 +65,7 @@ fn observations_carry_diagwire_read_provenance() {
         session,
         Session {
             id: session.id,
-            vehicle_id: car.id,
+            vehicle_id: Some(car.id),
             reported_vin: input.reported_vin.clone(),
             reported_chassis: input.reported_chassis.clone(),
             identity_conflict: IdentityConflict::default(),
@@ -446,28 +446,62 @@ fn storage_refuses_faults_under_a_failed_read() {
     assert_eq!(observation_counts(&g.conn), before);
 }
 
-// Backstop for ruling 1: storage refuses a session with no vehicle.
+// A session bound to no vehicle (the column allows it; only raw SQL can
+// make one today) is stored and can hold reads, and is returned for no
+// vehicle.
 #[test]
-fn storage_refuses_a_session_without_a_vehicle() {
-    let (_dir, _path, g) = new_garage();
-    let refused = g
-        .conn
+fn unbound_session_belongs_to_no_vehicle() {
+    let (_dir, _path, mut g) = new_garage();
+    g.record_writer().add_vehicle("Test car").unwrap();
+    let bound = start(&mut g, "test car");
+    g.conn
         .execute(
-            "INSERT INTO session (vehicle_id, vin_conflict, chassis_conflict,
+            "INSERT INTO session (vehicle_id, reported_vin, vin_conflict, chassis_conflict,
                  source, recorded_at, diagwire_rev)
-             VALUES (NULL, 0, 0, 'diagwire-read', ?1, 'rev')",
-            [NOW_STORED],
+             VALUES (NULL, 'TESTVIN0000000009', 0, 0, 'diagwire-read', ?1, ?2)",
+            [NOW_STORED, REVISION],
         )
-        .unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains("NOT NULL constraint failed: session.vehicle_id"),
-        "{refused}"
-    );
-    assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
-}
+        .unwrap();
+    let unbound = g.conn.last_insert_rowid();
 
+    let faults = FaultRead::Complete(vec![dtc(0x2A82, 0x24)]);
+    let in_unbound = g
+        .observation_writer()
+        .record_fault_read(unbound, 0x12, &faults)
+        .unwrap();
+    assert_eq!(
+        in_unbound,
+        FaultSnapshot {
+            id: in_unbound.id,
+            session_id: unbound,
+            ecu_address: 0x12,
+            read_at: NOW.parse().unwrap(),
+            read: faults,
+            identity_conflict: IdentityConflict::default(),
+            provenance: measured(NOW),
+        }
+    );
+    assert_eq!(observation_counts(&g.conn), [2, 1, 1]);
+
+    // Nothing was measured on the vehicle, and a later read of the same ECU
+    // on it does not pick up the unbound session's complete read.
+    assert_eq!(
+        g.latest_measured_faults("test car").unwrap(),
+        Outcome::Resolved(vec![])
+    );
+    let in_bound = g
+        .observation_writer()
+        .record_fault_read(bound.id, 0x12, &FaultRead::NoResponse)
+        .unwrap();
+    assert_eq!(
+        g.latest_measured_faults("test car").unwrap(),
+        Outcome::Resolved(vec![EcuFaults {
+            ecu_address: 0x12,
+            latest_complete: None,
+            newer_attempts: vec![in_bound],
+        }])
+    );
+}
 // G7, replay 6: a reported VIN or chassis that disagrees with the vehicle's
 // stored one is flagged on the session and on what was read in it. The
 // session is still written and the vehicle's record is untouched.
