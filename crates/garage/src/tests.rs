@@ -16,10 +16,10 @@ use crate::schema::{self, Migration};
 
 /// UTC now is the 14th; the host's local date is still the 13th, so a test
 /// can tell which one a default date came from.
-struct FixedClock;
+pub(crate) struct FixedClock;
 
-const NOW: &str = "2026-11-14T03:30:00Z";
-const NOW_STORED: &str = "2026-11-14T03:30:00.000000Z";
+pub(crate) const NOW: &str = "2026-11-14T03:30:00Z";
+pub(crate) const NOW_STORED: &str = "2026-11-14T03:30:00.000000Z";
 const TODAY: Date = date(2026, 11, 13);
 
 impl Clock for FixedClock {
@@ -31,29 +31,29 @@ impl Clock for FixedClock {
     }
 }
 
-fn clock() -> Arc<dyn Clock> {
+pub(crate) fn clock() -> Arc<dyn Clock> {
     Arc::new(FixedClock)
 }
 
-fn new_garage() -> (TempDir, PathBuf, Garage) {
+pub(crate) fn new_garage() -> (TempDir, PathBuf, Garage) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("garage.db");
     let g = Garage::create(&path, clock(), &Options::default()).unwrap();
     (dir, path, g)
 }
 
-fn count(conn: &Connection, table: &str) -> i64 {
+pub(crate) fn count(conn: &Connection, table: &str) -> i64 {
     conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
         .unwrap()
 }
 
-fn sidecars_absent(path: &Path) -> bool {
+pub(crate) fn sidecars_absent(path: &Path) -> bool {
     sidecars(path)[1..]
         .iter()
         .all(|p| !entry_exists(p).unwrap())
 }
 
-fn oil(date: Option<Date>) -> ServiceEventInput {
+pub(crate) fn oil(date: Option<Date>) -> ServiceEventInput {
     ServiceEventInput {
         date,
         summary: "Oil and filter".into(),
@@ -64,7 +64,7 @@ fn oil(date: Option<Date>) -> ServiceEventInput {
     }
 }
 
-fn resolved<T: std::fmt::Debug>(o: Outcome<T>) -> T {
+pub(crate) fn resolved<T: std::fmt::Debug>(o: Outcome<T>) -> T {
     match o {
         Outcome::Resolved(t) => t,
         other => panic!("expected Resolved, got {other:?}"),
@@ -75,12 +75,12 @@ fn label_of(label: &Option<Identifier>) -> Option<&str> {
     label.as_ref().map(|l| l.value.as_str())
 }
 
-fn is_constraint(r: rusqlite::Result<usize>) -> bool {
+pub(crate) fn is_constraint(r: rusqlite::Result<usize>) -> bool {
     matches!(r, Err(e) if e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation))
 }
 
 /// Every row of `table`, as text, to show a refused statement changed nothing.
-fn dump(conn: &Connection, table: &str) -> Vec<String> {
+pub(crate) fn dump(conn: &Connection, table: &str) -> Vec<String> {
     let cols: Vec<String> = conn
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
         .unwrap()
@@ -375,14 +375,14 @@ fn open_refuses_newer_version() {
     drop(g);
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 2)
+        .pragma_update(None, "user_version", schema::LATEST + 1)
         .unwrap();
     assert_open_refuses(&path, |e| {
         matches!(
             e,
             Error::TooNew {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         )
     });
@@ -445,9 +445,9 @@ fn open_missing_creates_nothing_and_create_refuses_existing() {
 #[test]
 fn failed_migration_rolls_back_table_and_version() {
     const FAILING: &[Migration] = &[Migration {
-        version: 2,
+        version: 3,
         sql: "CREATE TABLE probe (x INTEGER);
-              PRAGMA user_version = 2;
+              PRAGMA user_version = 3;
               INSERT INTO no_such_table VALUES (1);",
     }];
     let (_dir, path, mut g) = new_garage();
@@ -464,14 +464,14 @@ fn failed_migration_rolls_back_table_and_version() {
             .unwrap();
         (version, tables)
     };
-    assert_eq!(probe(&g.conn), (1, 0));
+    assert_eq!(probe(&g.conn), (2, 0));
     assert!(matches!(
         schema::migrate(&mut g.conn, FAILING),
         Err(Error::Sqlite(_))
     ));
-    assert_eq!(probe(&g.conn), (1, 0));
+    assert_eq!(probe(&g.conn), (2, 0));
     drop(g);
-    assert_eq!(probe(&Connection::open(&path).unwrap()), (1, 0));
+    assert_eq!(probe(&Connection::open(&path).unwrap()), (2, 0));
 }
 
 // 6. Replay 9: a write that meets another writer's lock fails with Busy at
@@ -607,10 +607,10 @@ fn unicode_case_folding_for_identifiers_and_references() {
 }
 
 /// A clock whose `now` a test can move, to tell rows apart by time.
-struct SteppingClock(std::sync::Mutex<Timestamp>);
+pub(crate) struct SteppingClock(pub(crate) std::sync::Mutex<Timestamp>);
 
 impl SteppingClock {
-    fn set(&self, ts: &str) {
+    pub(crate) fn set(&self, ts: &str) {
         *self.0.lock().unwrap() = ts.parse().unwrap();
     }
 }

@@ -449,7 +449,7 @@ impl Garage {
 
 /// Distinct vehicles with a live identifier equal to the normalised
 /// reference: one resolves, several are ambiguous, none is not found.
-fn resolve(conn: &Connection, reference: &str) -> Result<Resolution> {
+pub(crate) fn resolve(conn: &Connection, reference: &str) -> Result<Resolution> {
     let norm = normalize(reference);
     let mut stmt = conn.prepare(concat!(
         "SELECT ",
@@ -525,6 +525,31 @@ fn insert_ident(
         params![vehicle_id, kind.as_str(), value, norm, stamp.source, stamp.recorded_at, REVISION],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Whether `reported` disagrees with what is stored: the vehicle has a live
+/// identifier of `kind` and none of them equals `reported` once both are
+/// normalised. With no live identifier of that kind there is nothing to
+/// disagree with; a blank `reported` reports nothing.
+pub(crate) fn live_ident_disagrees(
+    conn: &Connection,
+    vehicle_id: i64,
+    kind: IdentKind,
+    reported: &str,
+) -> rusqlite::Result<bool> {
+    let norm = normalize(reported);
+    if norm.is_empty() {
+        return Ok(false);
+    }
+    conn.query_row(
+        concat!(
+            "SELECT count(*) > 0 AND sum(i.value_norm = ?3) = 0
+             FROM vehicle_ident i WHERE i.vehicle_id = ?1 AND i.kind = ?2 AND ",
+            live!("vehicle_ident", "i")
+        ),
+        params![vehicle_id, kind.as_str(), norm],
+        |r| r.get(0),
+    )
 }
 
 /// `target` must exist on this vehicle and not be superseded already.
@@ -640,7 +665,7 @@ fn event_from_row(
     })
 }
 
-fn provenance_from_row(r: &Row<'_>, first: usize) -> rusqlite::Result<Provenance> {
+pub(crate) fn provenance_from_row(r: &Row<'_>, first: usize) -> rusqlite::Result<Provenance> {
     Ok(Provenance {
         source: parse_col(r, first, Source::parse)?,
         recorded_at: parse_col(r, first + 1, |s| s.parse().ok())?,
@@ -648,7 +673,11 @@ fn provenance_from_row(r: &Row<'_>, first: usize) -> rusqlite::Result<Provenance
     })
 }
 
-fn parse_col<T>(r: &Row<'_>, idx: usize, parse: impl Fn(&str) -> Option<T>) -> rusqlite::Result<T> {
+pub(crate) fn parse_col<T>(
+    r: &Row<'_>,
+    idx: usize,
+    parse: impl Fn(&str) -> Option<T>,
+) -> rusqlite::Result<T> {
     let s: String = r.get(idx)?;
     parse(&s).ok_or_else(|| bad_value(idx, s))
 }
@@ -657,7 +686,7 @@ fn parse_col<T>(r: &Row<'_>, idx: usize, parse: impl Fn(&str) -> Option<T>) -> r
 #[error("unrecognised stored value {0:?}")]
 struct BadValue(String);
 
-fn bad_value(idx: usize, s: String) -> rusqlite::Error {
+pub(crate) fn bad_value(idx: usize, s: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(idx, Type::Text, Box::new(BadValue(s)))
 }
 
