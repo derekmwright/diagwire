@@ -419,9 +419,10 @@ fn last_live_identifier_cannot_be_retracted() {
 }
 
 // Vehicle retraction: an appended `vehicle_retraction` row. The vehicle is
-// hidden from reference resolution and from default queries, nothing more
-// can be written about it, and its history is kept. A second retraction
-// fails and adds no row (A1).
+// hidden from reference resolution and from default queries, no write that
+// takes a reference reaches it, and its record history is kept. A second
+// retraction fails and adds no row (A1). (A read in a session started
+// before the retraction is still stored: see `tests_observations.rs`.)
 #[test]
 fn vehicle_retraction_hides_the_vehicle_and_is_final() {
     let dir = tempfile::tempdir().unwrap();
@@ -551,7 +552,7 @@ fn vehicle_retraction_hides_the_vehicle_and_is_final() {
         Outcome::NotFound
     );
 
-    // Nothing more can be written about it.
+    // No write that takes a reference reaches it.
     let before = counts(&g.conn, ALL_TABLES);
     let mut w = g.record_writer();
     assert_eq!(

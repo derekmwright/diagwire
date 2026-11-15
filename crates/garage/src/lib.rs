@@ -39,7 +39,7 @@ pub use corrections::{VehicleHistory, VehicleRetraction};
 pub use notes::{Note, NoteInput};
 pub use observations::{
     Dtc, EcuFaults, FaultRead, FaultSnapshot, IdentityConflict, ObservationWriter, Session,
-    SessionInput,
+    SessionHistory, SessionInput,
 };
 pub use records::{
     IdentKind, Identifier, Odometer, OdometerUnit, Outcome, Provenance, RecordWriter, Resolution,
@@ -88,6 +88,8 @@ pub enum Error {
     BackupOutrun(u32),
     #[error("session {0} not found")]
     SessionNotFound(i64),
+    #[error("vehicle {0} not found")]
+    VehicleNotFound(i64),
     #[error("identifier is empty")]
     EmptyIdentifier,
     #[error("service event summary is empty")]
