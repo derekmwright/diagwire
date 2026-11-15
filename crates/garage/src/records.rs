@@ -527,6 +527,31 @@ fn insert_ident(
     Ok(conn.last_insert_rowid())
 }
 
+/// Whether `reported` disagrees with what is stored: the vehicle has a live
+/// identifier of `kind` and none of them equals `reported` once both are
+/// normalised. With no live identifier of that kind there is nothing to
+/// disagree with; a blank `reported` reports nothing.
+pub(crate) fn live_ident_disagrees(
+    conn: &Connection,
+    vehicle_id: i64,
+    kind: IdentKind,
+    reported: &str,
+) -> rusqlite::Result<bool> {
+    let norm = normalize(reported);
+    if norm.is_empty() {
+        return Ok(false);
+    }
+    conn.query_row(
+        concat!(
+            "SELECT count(*) > 0 AND sum(i.value_norm = ?3) = 0
+             FROM vehicle_ident i WHERE i.vehicle_id = ?1 AND i.kind = ?2 AND ",
+            live!("vehicle_ident", "i")
+        ),
+        params![vehicle_id, kind.as_str(), norm],
+        |r| r.get(0),
+    )
+}
+
 /// `target` must exist on this vehicle and not be superseded already.
 fn head_event(conn: &Connection, vehicle_id: i64, target: i64) -> Result<ServiceEvent> {
     let event = conn

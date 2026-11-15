@@ -253,6 +253,49 @@ fn commit_after_backup_forces_a_new_backup() {
     assert_eq!(late, 1);
 }
 
+// Ruling 3: when another writer commits after every backup, the migration
+// gives up after three backups, leaves no backup behind and migrates
+// nothing.
+#[test]
+fn migration_gives_up_after_three_outrun_backups() {
+    // More commits than the bound, but finitely many: without the bound the
+    // migration would succeed on a later backup instead of looping forever.
+    const COMMITS: usize = 5;
+    let (dir, path, rows) = v1_garage();
+    let target = dir.path().join("copy.backup");
+    let mut conn = raw_open(&path);
+    let other = raw_open(&path);
+    let mut calls = 0;
+
+    let result = schema::upgrade(&mut conn, schema::MIGRATIONS, &mut |c, _| {
+        calls += 1;
+        let taken = backup::take(c, &target)?;
+        if calls <= COMMITS {
+            other
+                .execute(
+                    "INSERT INTO vehicle (source, recorded_at, diagwire_rev)
+                     VALUES ('maintainer-entry', 'late', 'rev')",
+                    [],
+                )
+                .unwrap();
+        }
+        Ok(taken)
+    });
+
+    assert!(matches!(result, Err(Error::BackupOutrun(3))), "{result:?}");
+    assert_eq!(calls, 3);
+    // Not migrated: still v1, holding its own rows and the other writer's.
+    assert_eq!(user_version(&conn), 1);
+    for table in V2_TABLES {
+        assert!(!has_table(&conn, table), "{table}");
+    }
+    assert_eq!(count(&conn, "vehicle"), 5);
+    assert_eq!(dump(&conn, "vehicle")[..2], rows[0][..]);
+    assert_eq!(v1_dumps(&conn)[1..], rows[1..]);
+    drop(conn);
+    drop(other);
+    assert_eq!(entries(dir.path()), ["garage.db"]);
+}
 fn no_backup(_: &Connection, _: i64) -> Result<BackupFile> {
     panic!("a backup was requested");
 }

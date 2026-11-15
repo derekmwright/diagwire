@@ -13,6 +13,10 @@ pub(crate) struct Migration {
 
 pub(crate) const LATEST: i64 = 2;
 
+/// How many backups one migration takes before giving up, when other
+/// connections keep committing between a backup and the migration's lock.
+pub(crate) const MAX_BACKUPS: u32 = 3;
+
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -51,14 +55,16 @@ pub(crate) fn migrate(conn: &mut Connection, steps: &[Migration]) -> Result<i64>
 /// nothing is. The steps then run in one `BEGIN IMMEDIATE` transaction, but
 /// only if no other connection committed since before the backup's
 /// snapshot; if one did, the lock is released, that backup is discarded and
-/// a new one is taken. A backup is kept only when the migration commits.
+/// a new one is taken, up to [`MAX_BACKUPS`] in all, after which the
+/// migration gives up with [`Error::BackupOutrun`]. A backup is kept only
+/// when the migration commits.
 pub(crate) fn upgrade(
     conn: &mut Connection,
     steps: &[Migration],
     backup: &mut dyn FnMut(&Connection, i64) -> Result<BackupFile>,
 ) -> Result<i64> {
     let target = steps.last().map_or(0, |s| s.version);
-    loop {
+    for _ in 0..MAX_BACKUPS {
         // Read before the backup starts, so a commit that the backup's
         // snapshot misses always changes this value.
         let seen = data_version(conn)?;
@@ -78,6 +84,7 @@ pub(crate) fn upgrade(
             }
         }
     }
+    Err(Error::BackupOutrun(MAX_BACKUPS))
 }
 
 /// `None` means another connection committed after `seen` was read, so the
@@ -199,13 +206,17 @@ BEGIN SELECT RAISE(ABORT, 'supersede must stay on the same vehicle'); END;
 // Observation tables. A session's `source` is limited to the measured kind
 // this binary writes (backstop to G2's writer split); a snapshot and its
 // DTC rows carry provenance through the NOT NULL link to their session
-// (G4). `outcome` mirrors DR-0001 D10. Append-only by trigger (G5).
+// (G4). A session always belongs to a vehicle, and records at insert
+// whether its reported VIN or chassis disagreed with that vehicle's (G7).
+// `outcome` mirrors DR-0001 D10. Append-only by trigger (G5).
 const V2: &str = "
 CREATE TABLE session (
     id               INTEGER PRIMARY KEY,
-    vehicle_id       INTEGER REFERENCES vehicle(id),
+    vehicle_id       INTEGER NOT NULL REFERENCES vehicle(id),
     reported_vin     TEXT,
     reported_chassis TEXT,
+    vin_conflict     INTEGER NOT NULL CHECK (vin_conflict IN (0, 1)),
+    chassis_conflict INTEGER NOT NULL CHECK (chassis_conflict IN (0, 1)),
     source           TEXT NOT NULL CHECK (source = 'diagwire-read'),
     recorded_at      TEXT NOT NULL,
     diagwire_rev     TEXT NOT NULL

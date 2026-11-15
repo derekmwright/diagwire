@@ -65,9 +65,10 @@ fn observations_carry_diagwire_read_provenance() {
         session,
         Session {
             id: session.id,
-            vehicle_id: Some(car.id),
+            vehicle_id: car.id,
             reported_vin: input.reported_vin.clone(),
             reported_chassis: input.reported_chassis.clone(),
+            identity_conflict: IdentityConflict::default(),
             provenance: measured(T1),
         }
     );
@@ -86,6 +87,7 @@ fn observations_carry_diagwire_read_provenance() {
             ecu_address: 0x12,
             read_at: T2.parse().unwrap(),
             read: faults,
+            identity_conflict: IdentityConflict::default(),
             provenance: measured(T1),
         }
     );
@@ -118,13 +120,20 @@ fn observations_carry_diagwire_read_provenance() {
     // Backstop: storage refuses a session with a record source.
     let before = observation_counts(&g.conn);
     for source in ["maintainer-entry", "imported-note"] {
-        assert!(
-            is_constraint(g.conn.execute(
-                "INSERT INTO session (vehicle_id, source, recorded_at, diagwire_rev)
-                 VALUES (?1, ?2, ?3, 'rev')",
+        let refused = g
+            .conn
+            .execute(
+                "INSERT INTO session (vehicle_id, vin_conflict, chassis_conflict,
+                     source, recorded_at, diagwire_rev)
+                 VALUES (?1, 0, 0, ?2, ?3, 'rev')",
                 rusqlite::params![car.id, source, NOW_STORED],
-            )),
-            "{source}"
+            )
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("CHECK constraint failed: source"),
+            "{source}: {refused}"
         );
     }
 
@@ -380,9 +389,20 @@ fn observed_garage() -> (tempfile::TempDir, Garage, FaultSnapshot, FaultSnapshot
 // Append-only: storage rejects edits and deletes on the observation tables.
 #[test]
 fn observation_tables_are_append_only() {
-    let (_dir, g, _complete, _failed) = observed_garage();
-    assert_eq!(observation_counts(&g.conn), [1, 2, 1]);
+    let (_dir, mut g, _complete, _failed) = observed_garage();
+    // A session nothing refers to, so that only the trigger (and no foreign
+    // key) stands between it and a DELETE.
+    let lone = start(&mut g, "test car");
+    assert_eq!(observation_counts(&g.conn), [2, 2, 1]);
     let before = OBSERVATION_TABLES.map(|t| dump(&g.conn, t));
+    let refused = g
+        .conn
+        .execute("DELETE FROM session WHERE id = ?1", [lone.id])
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("append-only"),
+        "the lone session's DELETE was refused by something else: {refused}"
+    );
     for sql in [
         "UPDATE session SET reported_vin = 'edited'",
         "DELETE FROM session",
@@ -424,4 +444,198 @@ fn storage_refuses_faults_under_a_failed_read() {
         );
     }
     assert_eq!(observation_counts(&g.conn), before);
+}
+
+// Backstop for ruling 1: storage refuses a session with no vehicle.
+#[test]
+fn storage_refuses_a_session_without_a_vehicle() {
+    let (_dir, _path, g) = new_garage();
+    let refused = g
+        .conn
+        .execute(
+            "INSERT INTO session (vehicle_id, vin_conflict, chassis_conflict,
+                 source, recorded_at, diagwire_rev)
+             VALUES (NULL, 0, 0, 'diagwire-read', ?1, 'rev')",
+            [NOW_STORED],
+        )
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("NOT NULL constraint failed: session.vehicle_id"),
+        "{refused}"
+    );
+    assert_eq!(observation_counts(&g.conn), [0, 0, 0]);
+}
+
+// G7, replay 6: a reported VIN or chassis that disagrees with the vehicle's
+// stored one is flagged on the session and on what was read in it. The
+// session is still written and the vehicle's record is untouched.
+#[test]
+fn replay6_identity_conflict_is_flagged_and_changes_nothing() {
+    let (_dir, _path, mut g) = new_garage();
+    let mut w = g.record_writer();
+    let known = w.add_vehicle("Known car").unwrap();
+    resolved(
+        w.add_identifier("known car", IdentKind::Vin, "TESTVIN0000000001")
+            .unwrap(),
+    );
+    resolved(
+        w.add_identifier("known car", IdentKind::Chassis, "E46")
+            .unwrap(),
+    );
+    // No stored VIN or chassis to disagree with.
+    w.add_vehicle("Bare car").unwrap();
+    let vehicles = ["vehicle", "vehicle_ident"].map(|t| dump(&g.conn, t));
+
+    let report = |vin: Option<&str>, chassis: Option<&str>| SessionInput {
+        reported_vin: vin.map(Into::into),
+        reported_chassis: chassis.map(Into::into),
+    };
+    let flags = |vin, chassis| IdentityConflict { vin, chassis };
+    let cases = [
+        // (vehicle, reported, expected flags)
+        (
+            "known car",
+            report(Some("TESTVIN0000000002"), None),
+            flags(true, false),
+        ),
+        (
+            "known car",
+            report(Some(" testvin0000000001 "), Some("E90")),
+            flags(false, true),
+        ),
+        (
+            "known car",
+            report(Some("OTHERVIN000000009"), Some("G05")),
+            flags(true, true),
+        ),
+        (
+            "known car",
+            report(Some("TestVin0000000001"), Some(" e46")),
+            flags(false, false),
+        ),
+        ("known car", report(None, None), flags(false, false)),
+        (
+            "known car",
+            report(Some("  "), Some("")),
+            flags(false, false),
+        ),
+        (
+            "bare car",
+            report(Some("TESTVIN0000000002"), Some("E90")),
+            flags(false, false),
+        ),
+    ];
+    let mut sessions = Vec::new();
+    for (reference, input, expected) in &cases {
+        let session = resolved(
+            g.observation_writer()
+                .start_session(reference, input)
+                .unwrap(),
+        );
+        assert_eq!(
+            session.identity_conflict, *expected,
+            "{reference} {input:?}"
+        );
+        assert_eq!(
+            session.identity_conflict.any(),
+            expected.vin || expected.chassis
+        );
+        // Stored as reported, not normalised and not corrected.
+        assert_eq!(session.reported_vin, input.reported_vin);
+        assert_eq!(session.reported_chassis, input.reported_chassis);
+        sessions.push(session);
+    }
+
+    // Every session was written, with the flags stored on its row.
+    let stored: Vec<(i64, bool, bool)> = g
+        .conn
+        .prepare("SELECT id, vin_conflict, chassis_conflict FROM session ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let expected: Vec<(i64, bool, bool)> = sessions
+        .iter()
+        .zip(&cases)
+        .map(|(s, (_, _, f))| (s.id, f.vin, f.chassis))
+        .collect();
+    assert_eq!(stored, expected);
+
+    // What is read in a flagged session carries the flag, from the writer
+    // and from the query; a clean session's reads carry none.
+    let flagged = &sessions[2];
+    let clean = &sessions[3];
+    let mut w = g.observation_writer();
+    let in_flagged = w
+        .record_fault_read(flagged.id, 0x12, &FaultRead::Complete(vec![]))
+        .unwrap();
+    let in_clean = w
+        .record_fault_read(clean.id, 0x18, &FaultRead::NoResponse)
+        .unwrap();
+    assert_eq!(in_flagged.identity_conflict, flags(true, true));
+    assert_eq!(in_clean.identity_conflict, flags(false, false));
+    assert_eq!(
+        g.latest_measured_faults("known car").unwrap(),
+        Outcome::Resolved(vec![
+            EcuFaults {
+                ecu_address: 0x12,
+                latest_complete: Some(in_flagged),
+                newer_attempts: vec![],
+            },
+            EcuFaults {
+                ecu_address: 0x18,
+                latest_complete: None,
+                newer_attempts: vec![in_clean],
+            },
+        ])
+    );
+
+    // The vehicle record is unchanged, and still resolves by its own VIN.
+    assert_eq!(
+        ["vehicle", "vehicle_ident"].map(|t| dump(&g.conn, t)),
+        vehicles
+    );
+    assert_eq!(
+        resolved(g.resolve("TESTVIN0000000001").unwrap()).vehicle_id,
+        known.id
+    );
+    assert_eq!(g.resolve("TESTVIN0000000002").unwrap(), Outcome::NotFound);
+}
+
+// Ruling 5: "newest" is the order reads were written in (row id), not the
+// order of their timestamps. The time is taken before the write lock, so
+// two writers can commit out of timestamp order.
+#[test]
+fn newest_is_write_order_not_timestamp_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(SteppingClock(Mutex::new(NOW.parse().unwrap())));
+    let mut g =
+        Garage::create(&dir.path().join("g.db"), clock.clone(), &Options::default()).unwrap();
+    g.record_writer().add_vehicle("Test car").unwrap();
+    let session = start(&mut g, "test car");
+    let mut record = |at: &str, read: FaultRead| {
+        clock.set(at);
+        g.observation_writer()
+            .record_fault_read(session.id, 0x12, &read)
+            .unwrap()
+    };
+    // Written first, with the latest timestamp.
+    let first = record(T3, FaultRead::Complete(vec![dtc(0x2A82, 0x24)]));
+    let second = record(T2, FaultRead::NoResponse);
+    // Written last, with the earliest timestamp.
+    let last = record(T1, FaultRead::Complete(vec![]));
+    assert!(first.id < second.id && second.id < last.id);
+    assert!(first.read_at > second.read_at && second.read_at > last.read_at);
+
+    assert_eq!(
+        g.latest_measured_faults("test car").unwrap(),
+        Outcome::Resolved(vec![EcuFaults {
+            ecu_address: 0x12,
+            latest_complete: Some(last),
+            newer_attempts: vec![],
+        }])
+    );
 }

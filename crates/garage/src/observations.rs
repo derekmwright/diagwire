@@ -6,8 +6,8 @@ use jiff::Timestamp;
 use rusqlite::{Connection, Row, TransactionBehavior, params};
 
 use crate::records::{
-    Outcome, Provenance, Source, bad_value, format_timestamp, parse_col, provenance_from_row,
-    resolve,
+    IdentKind, Outcome, Provenance, Source, bad_value, format_timestamp, live_ident_disagrees,
+    parse_col, provenance_from_row, resolve,
 };
 use crate::{Clock, Error, Garage, REVISION, Result};
 
@@ -18,7 +18,7 @@ const OBSERVATION_SOURCE: Source = Source::DiagwireRead;
 macro_rules! snapshot_cols {
     () => {
         "f.id, f.session_id, f.ecu_address, f.outcome, f.nrc, f.read_at, \
-         s.source, s.recorded_at, s.diagwire_rev"
+         s.source, s.recorded_at, s.diagwire_rev, s.vin_conflict, s.chassis_conflict"
     };
 }
 
@@ -30,12 +30,30 @@ pub struct SessionInput {
     pub reported_chassis: Option<String>,
 }
 
+/// Which of a session's reported identifiers disagreed, when the session
+/// was written, with the live identifier of that kind stored for its
+/// vehicle (G7). The session is written all the same and the vehicle's
+/// record is not changed; the user settles it. A reported value with no
+/// stored counterpart is not a conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdentityConflict {
+    pub vin: bool,
+    pub chassis: bool,
+}
+
+impl IdentityConflict {
+    pub fn any(self) -> bool {
+        self.vin || self.chassis
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub id: i64,
-    pub vehicle_id: Option<i64>,
+    pub vehicle_id: i64,
     pub reported_vin: Option<String>,
     pub reported_chassis: Option<String>,
+    pub identity_conflict: IdentityConflict,
     pub provenance: Provenance,
 }
 
@@ -92,6 +110,8 @@ pub struct FaultSnapshot {
     /// UTC.
     pub read_at: Timestamp,
     pub read: FaultRead,
+    /// The identity conflict flagged on the session this was read in.
+    pub identity_conflict: IdentityConflict,
     pub provenance: Provenance,
 }
 
@@ -122,7 +142,8 @@ impl<'g> ObservationWriter<'g> {
 
     /// Starts a session on the vehicle `reference` names, resolved in the
     /// same transaction as the insert. `Ambiguous` and `NotFound` write
-    /// nothing.
+    /// nothing. A reported VIN or chassis that disagrees with the vehicle's
+    /// stored one is flagged on the session, which is still written.
     pub fn start_session(
         &mut self,
         reference: &str,
@@ -137,14 +158,24 @@ impl<'g> ObservationWriter<'g> {
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
+        let disagrees = |kind, reported: &Option<String>| match reported {
+            Some(value) => live_ident_disagrees(&tx, vehicle_id, kind, value),
+            None => Ok(false),
+        };
+        let conflict = IdentityConflict {
+            vin: disagrees(IdentKind::Vin, &input.reported_vin)?,
+            chassis: disagrees(IdentKind::Chassis, &input.reported_chassis)?,
+        };
         tx.execute(
             "INSERT INTO session (vehicle_id, reported_vin, reported_chassis,
-                 source, recorded_at, diagwire_rev)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 vin_conflict, chassis_conflict, source, recorded_at, diagwire_rev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 vehicle_id,
                 input.reported_vin,
                 input.reported_chassis,
+                conflict.vin,
+                conflict.chassis,
                 OBSERVATION_SOURCE.as_str(),
                 recorded_at,
                 REVISION,
@@ -152,7 +183,7 @@ impl<'g> ObservationWriter<'g> {
         )?;
         let session = tx.query_row(
             "SELECT id, vehicle_id, reported_vin, reported_chassis,
-                    source, recorded_at, diagwire_rev
+                    source, recorded_at, diagwire_rev, vin_conflict, chassis_conflict
              FROM session WHERE id = ?1",
             [tx.last_insert_rowid()],
             |r| {
@@ -161,6 +192,10 @@ impl<'g> ObservationWriter<'g> {
                     vehicle_id: r.get(1)?,
                     reported_vin: r.get(2)?,
                     reported_chassis: r.get(3)?,
+                    identity_conflict: IdentityConflict {
+                        vin: r.get(7)?,
+                        chassis: r.get(8)?,
+                    },
                     provenance: provenance_from_row(r, 4)?,
                 })
             },
@@ -314,6 +349,10 @@ fn stored_from_row(r: &Row<'_>) -> rusqlite::Result<Stored> {
             ecu_address: r.get(2)?,
             read_at: parse_col(r, 5, |s| s.parse().ok())?,
             read,
+            identity_conflict: IdentityConflict {
+                vin: r.get(9)?,
+                chassis: r.get(10)?,
+            },
             provenance: provenance_from_row(r, 6)?,
         },
     })

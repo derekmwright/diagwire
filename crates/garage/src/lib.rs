@@ -30,7 +30,8 @@ mod tests_observations;
 
 pub use clock::{Clock, SystemClock};
 pub use observations::{
-    Dtc, EcuFaults, FaultRead, FaultSnapshot, ObservationWriter, Session, SessionInput,
+    Dtc, EcuFaults, FaultRead, FaultSnapshot, IdentityConflict, ObservationWriter, Session,
+    SessionInput,
 };
 pub use records::{
     IdentKind, Identifier, Odometer, OdometerUnit, Outcome, Provenance, RecordWriter, Resolution,
@@ -75,6 +76,8 @@ pub enum Error {
     Busy,
     #[error("the garage could not be backed up, so it was not migrated: {0}")]
     Backup(#[source] Box<Error>),
+    #[error("other writers changed the garage after each of {0} backups, so it was not migrated")]
+    BackupOutrun(u32),
     #[error("session {0} not found")]
     SessionNotFound(i64),
     #[error("identifier is empty")]
@@ -177,7 +180,9 @@ impl Garage {
     /// A garage written by an older version is migrated, after a backup of
     /// it has been written next to it (named after the garage file, the
     /// version migrated from and the time). If the backup fails, so does
-    /// the open ([`Error::Backup`]) and the garage is unchanged.
+    /// the open ([`Error::Backup`]) and the garage is unchanged. So it does
+    /// if other writers keep changing the garage between each backup and
+    /// the migration ([`Error::BackupOutrun`]).
     pub fn open(path: &Path, clock: Arc<dyn Clock>, options: &Options) -> Result<Self> {
         let busy_ms = options.busy_timeout_ms()?;
         match fs::metadata(path) {
