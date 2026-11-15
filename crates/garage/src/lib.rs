@@ -1,7 +1,9 @@
-//! The garage: vehicles, their identifiers and service history in one local
-//! SQLite file (DR-0002). Synchronous, with no transport or car I/O. Callers
-//! never see a `rusqlite::Connection` or raw SQL; writes go through
-//! [`RecordWriter`], which sets each row's provenance itself.
+//! The garage: vehicles, their identifiers, service history and measured
+//! faults in one local SQLite file (DR-0002). Synchronous, with no transport
+//! or car I/O. Callers never see a `rusqlite::Connection` or raw SQL. Writes
+//! go through two capabilities, each of which sets its rows' provenance
+//! itself: [`RecordWriter`] for what the maintainer states, and
+//! [`ObservationWriter`] for what diagwire read from a car.
 //!
 //! `create`/`open` take an explicit path. There is no default-path function
 //! here (G9); front ends resolve the path.
@@ -13,14 +15,23 @@ use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
+mod backup;
 mod clock;
+mod observations;
 mod records;
 mod schema;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_migration;
+#[cfg(test)]
+mod tests_observations;
 
 pub use clock::{Clock, SystemClock};
+pub use observations::{
+    Dtc, EcuFaults, FaultRead, FaultSnapshot, ObservationWriter, Session, SessionInput,
+};
 pub use records::{
     IdentKind, Identifier, Odometer, OdometerUnit, Outcome, Provenance, RecordWriter, Resolution,
     ServiceEvent, ServiceEventInput, Source, Vehicle, VehicleRef,
@@ -62,6 +73,10 @@ pub enum Error {
     BusyTimeoutOutOfRange(Duration),
     #[error("garage is locked by another writer")]
     Busy,
+    #[error("the garage could not be backed up, so it was not migrated: {0}")]
+    Backup(#[source] Box<Error>),
+    #[error("session {0} not found")]
+    SessionNotFound(i64),
     #[error("identifier is empty")]
     EmptyIdentifier,
     #[error("service event summary is empty")]
@@ -155,9 +170,14 @@ impl Garage {
         Ok(Self { conn, clock })
     }
 
-    /// Opens an existing garage. Never creates a file. Checks the SQLite
+    /// Opens an existing garage. Never creates a garage. Checks the SQLite
     /// version, `application_id` and `user_version` before changing any
     /// configuration, and refuses a foreign or newer file.
+    ///
+    /// A garage written by an older version is migrated, after a backup of
+    /// it has been written next to it (named after the garage file, the
+    /// version migrated from and the time). If the backup fails, so does
+    /// the open ([`Error::Backup`]) and the garage is unchanged.
     pub fn open(path: &Path, clock: Arc<dyn Clock>, options: &Options) -> Result<Self> {
         let busy_ms = options.busy_timeout_ms()?;
         match fs::metadata(path) {
@@ -178,17 +198,29 @@ impl Garage {
                 supported: schema::LATEST,
             });
         }
-        // v1 is creation only: there is no older version to migrate from.
-        if version != schema::LATEST {
+        // Version 1 is the oldest a garage can have.
+        if version < 1 {
             return Err(Error::UnknownVersion(version));
         }
+        let mut conn = conn;
         configure(&conn, busy_ms)?;
+        if version < schema::LATEST {
+            schema::upgrade(&mut conn, schema::MIGRATIONS, &mut |c, from| {
+                backup::take(c, &backup::path_for(path, from, clock.now()))
+            })?;
+        }
         Ok(Self { conn, clock })
     }
 
     /// The writer for maintainer records. It sets `source` itself.
     pub fn record_writer(&mut self) -> RecordWriter<'_> {
         RecordWriter::new(&mut self.conn, self.clock.as_ref())
+    }
+
+    /// The writer for what diagwire read from a car. It sets `source`
+    /// itself.
+    pub fn observation_writer(&mut self) -> ObservationWriter<'_> {
+        ObservationWriter::new(&mut self.conn, self.clock.as_ref())
     }
 }
 
