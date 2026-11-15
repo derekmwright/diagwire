@@ -1,6 +1,6 @@
 # Garage slice 3: worker result note
 
-*Corrected after review round 1 (see the last section). The sections up to "Deviations" describe the code at `d276403`; what round 1 changed is in the last section, and corrected statements are marked "(r1)".*
+*Corrected after review rounds 1 and 2 (see the last two sections). The sections up to "Deviations" describe the code at `d276403`; what each round changed is in its own section, and corrected statements are marked "(r1)" or "(r2)". Round 2 reversed part of round 1: at the current tip a fault read for a retracted vehicle is refused.*
 
 **Record:** DR-0002, slice 3: notes, identifier correction and vehicle retraction, on the record-writer side of `crates/garage`, including the paragraph "A1 tests owed by the slice that adds identifier correction and vehicle retraction". **Branch:** `worktree-agent-a3a5cf9851bc0c837`. **Code commit:** `d27640352c8e8965093d60d0bac6be3ddab3fc24`. Windows 11, Rust 1.100.0. Work started 2026-11-14; the negative controls, the gates and this note were done on 2026-11-15 after the session was interrupted.
 
@@ -60,7 +60,7 @@ All use `tempfile` directories and the injected `FixedClock` or `SteppingClock`.
 5. **`a1_retracted_identifier_is_final_and_fresh_alias_works_on_same_vehicle`** (A1). Retracting an alias returns a row that repeats it; the alias stops resolving, is gone from the vehicle's live identifiers, and history has the retraction. Superseding the retraction: `RetractionIsFinal`; retracting it: `AlreadyRetracted`; superseding its target: `AlreadySuperseded`; nothing written. A fresh identifier with the same normalised alias on the same vehicle succeeds and resolves; history keeps the retraction. A subsequent live duplicate on another vehicle is refused, as a new identifier and as a correction, with nothing written.
 6. **`a1_retracted_alias_can_be_added_to_another_vehicle`** (A1, "separately"). While the alias is live on the first vehicle, the second is refused it. After retraction the same normalised alias is added to the second vehicle and resolves there; the first vehicle's history keeps the retraction. Adding it back to the first vehicle is then refused with nothing written.
 7. **`last_live_identifier_cannot_be_retracted`.** See deviation 1. A vehicle's only identifier cannot be retracted (`LastIdentifier`, nothing written, still resolves). With an alias added the label can be retracted (the vehicle then has no label and resolves by alias); the alias is then the last and is refused.
-8. **`vehicle_retraction_hides_the_vehicle_and_is_final`** (A1). A vehicle with four identifiers, a service event, a note and a measured read, and a second vehicle sharing its chassis. Before: the chassis is ambiguous. An empty reason, an ambiguous reference and an unknown reference write nothing. The retraction is returned whole (vehicle, label, trimmed reason, provenance at the retraction's time). Dumps of the other seven tables are unchanged. Afterwards: label, alias and VIN resolve to nothing; the shared chassis resolves to the other vehicle; `vehicles()` lists only the other vehicle; `vehicle`, `service_events`, `service_event_history`, `notes`, `note_history`, `identifier_history` and `latest_measured_faults` return `NotFound`; ten write methods (nine on `RecordWriter`, plus `start_session`) return `NotFound` with all eight table counts unchanged. (r1) These are the writes that take a reference. `record_fault_read` takes a session id and is not among them: a session started before the retraction still stores its reads (ruling 5, round 1 section). A second retraction through each of three references returns `NotFound`, and a raw second row fails with `UNIQUE constraint failed: vehicle_retraction.vehicle_id`; the table still has one row. `vehicle_history()` equals the history read before the retraction with the retraction added.
+8. **`vehicle_retraction_hides_the_vehicle_and_is_final`** (A1). A vehicle with four identifiers, a service event, a note and a measured read, and a second vehicle sharing its chassis. Before: the chassis is ambiguous. An empty reason, an ambiguous reference and an unknown reference write nothing. The retraction is returned whole (vehicle, label, trimmed reason, provenance at the retraction's time). Dumps of the other seven tables are unchanged. Afterwards: label, alias and VIN resolve to nothing; the shared chassis resolves to the other vehicle; `vehicles()` lists only the other vehicle; `vehicle`, `service_events`, `service_event_history`, `notes`, `note_history`, `identifier_history` and `latest_measured_faults` return `NotFound`; ten write methods (nine on `RecordWriter`, plus `start_session`) return `NotFound` with all eight table counts unchanged. (r1) These are the writes that take a reference. `record_fault_read` takes a session id and is not among them: ~~a session started before the retraction still stores its reads (ruling 5, round 1 section)~~ (r2) at `d276403` and `72e8db8` it still stored a read in a session started before the retraction; ruling 5 was withdrawn and it is now refused (round 2 section). A second retraction through each of three references returns `NotFound`, and a raw second row fails with `UNIQUE constraint failed: vehicle_retraction.vehicle_id`; the table still has one row. `vehicle_history()` equals the history read before the retraction with the retraction added.
 9. **`a1_replacement_vehicle_is_a_new_anchor`** (A1). The old vehicle has an alias, a VIN, four service event rows (with a supersede and a retraction) and two note rows. While it is live another vehicle is refused its VIN. After its retraction a new vehicle is added with the same label; it has a new id and the vehicle count is 3; it takes the old alias and VIN; all three references resolve to it; it has no service events or notes; a new event goes to it; the VIN is again refused on the third vehicle. The old vehicle's entry in `vehicle_history()` equals what was read before, plus the retraction, and every row stored before is still stored unchanged (dump prefix per record table).
 10. **`corrections_carry_maintainer_entry_provenance`.** Times T1 to T5. Provenance of the superseding row, the retraction row and the vehicle retraction from the writer; of every row from `identifier_history`, `vehicles()` and `vehicle_history()`; and of every stored `vehicle_ident` and `vehicle_retraction` row. A raw `vehicle_retraction` row with `diagwire-read`, for a vehicle with no retraction, fails with `CHECK constraint failed: source`.
 11. **`vehicle_retraction_and_vehicle_anchor_are_append_only`.** `DELETE` and `UPDATE` of a retraction row (no table refers to it) and `DELETE` of a vehicle anchor made by raw SQL that nothing refers to each fail with an error containing `append-only`; dumps unchanged. The anchor case closes a gap in slice 1's test, where `DELETE FROM vehicle` is also refused by the foreign key from `vehicle_ident`.
@@ -195,7 +195,7 @@ For the architect. Items 1 to 3 are behaviour the record does not state and that
 
 Verdict: `docs/notes/2026-11-15-garage-slice3-review-r1.md` (CHANGES REQUIRED: one spec deviation, one test gap). Rulings: `docs/notes/2026-11-15-garage-slice3-architect-rulings.md`. Both files were committed as received in `e0ebb671f1b3ac7e8cd422a611e8acc4b2acb2de`. Code and tests: `72e8db8244c7682ace3ece268dc6ee99640144f6`. Only `crates/garage` and this note changed. The first run of the changed suite passed 46 of 46; no test failed in the worktree.
 
-I checked rulings 4 and 5 against the record before building them. G5 says a retraction hides its target from default queries and keeps it in history; neither ruling contradicts that or any other line I found. Rulings 1 to 3 accept deviations 1 to 3 as built.
+I checked rulings 4 and 5 against the record before building them. G5 says a retraction hides its target from default queries and keeps it in history; neither ruling contradicts that or any other line I found. (r2) That check was wrong for ruling 5: I compared it with G5 and missed G7's consequence ("every write about an existing vehicle takes a reference and resolves it in the same `BEGIN IMMEDIATE` transaction as the insert"). Review round 2 found it. Rulings 1 to 3 accept deviations 1 to 3 as built.
 
 Line counts at `72e8db8`: `lib.rs` 355, `observations.rs` 433, `tests_corrections.rs` 1042, `tests_observations.rs` 994; the other files are unchanged.
 
@@ -207,13 +207,17 @@ Line counts at `72e8db8`: `lib.rs` 355, `observations.rs` 433, `tests_correction
 
 ### 2. Finding 2 / ruling 5: a session started before the retraction
 
+*(r2) Reversed: ruling 5 was withdrawn in round 2. At the current tip the late read is refused, the test below was replaced, and the doc comment was changed again. What follows in this subsection describes `72e8db8` only.*
+
 **No production change.** `record_fault_read` already accepted a read in any existing session; ruling 5 makes that the intended behaviour. Its doc comment now says so. `start_session` already returned `NotFound` for a retracted vehicle (test 8).
 
 **Test (new): `session_started_before_retraction_can_finish_and_none_can_start`.** Same fixture; the vehicle is retracted with its session open. `start_session` under its label and its alias returns `NotFound` and the three observation counts are unchanged. `record_fault_read` in the old session stores a complete read with one fault and returns it whole (session, ECU, time, fault, `diagwire-read` provenance); counts grow by one snapshot and one fault row. `observation_history` has that session with three reads, the late one last. `latest_measured_faults` under the vehicle's references returns `NotFound`; under the shared chassis and the other vehicle's label it returns exactly one snapshot, of the other vehicle's session, which is not the late one.
 
-**Claims narrowed.** The header comment of test 8 and its inline comment said "nothing more can be written about it". They now say "no write that takes a reference reaches it" and point to the test above. The test's name (`vehicle_retraction_hides_the_vehicle_and_is_final`) made no such claim and is unchanged. In this note, test 8's description, the "reads made consistent" list and deviations 7 and 8 are corrected in place. What is true at `72e8db8`: after a vehicle is retracted, every write that takes a reference returns `NotFound` and writes nothing; a read in a session that already exists is still stored; nothing else writes.
+**Claims narrowed.** The header comment of test 8 and its inline comment said "nothing more can be written about it". They now say "no write that takes a reference reaches it" and point to the test above. The test's name (`vehicle_retraction_hides_the_vehicle_and_is_final`) made no such claim and is unchanged. In this note, test 8's description, the "reads made consistent" list and deviations 7 and 8 are corrected in place. What is true at `72e8db8`: after a vehicle is retracted, every write that takes a reference returns `NotFound` and writes nothing; a read in a session that already exists is still stored; nothing else writes. (r2) At the current tip that read is refused too, so nothing is written about a retracted vehicle through this crate's API.
 
 ### Negative controls (round 1)
+
+*(r2) The test `session_started_before_retraction_can_finish_and_none_can_start` named in r1a, r1b and r1c no longer exists; r1b's edit is now the production behaviour. The outputs below are those of `72e8db8`.*
 
 Same method as before, from `git archive` of `72e8db8244c7682ace3ece268dc6ee99640144f6`, each in its own copy with its own new `CARGO_TARGET_DIR`, under short directory names (`r1\r1a` …). `r1z`, with no edit and no filter, passed 46 of 46 (exit 0). The four controls exited 101.
 
@@ -259,7 +263,7 @@ assertion failed: matches!(g.observation_history(9999), Err(Error::VehicleNotFou
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.06s
 ```
 
-Not controlled separately: that the late read is absent from the other vehicle's default result (it follows from the query's vehicle filter, which slice 2's r2nc1 controlled); the order of sessions and reads in the history.
+(r2: no late read is stored any more.) Not controlled separately: that the late read is absent from the other vehicle's default result (it follows from the query's vehicle filter, which slice 2's r2nc1 controlled); the order of sessions and reads in the history.
 
 ### Gate results at `72e8db8` (worktree)
 
@@ -291,5 +295,83 @@ It reused the check made by the same command on the same sources before the comm
 - `observation_history` returns all of a vehicle's sessions and reads in one call, with no paging or filter by ECU. Sessions with no reads are included.
 - It takes the vehicle id, not a reference, for retracted and live vehicles alike. A session bound to no vehicle (`vehicle_id` NULL, which no writer creates yet) is returned for no id; that is unchanged from slice 2.
 - `Error::VehicleNotFound` is new. Returning an empty list for an unknown id would have been the other choice.
-- A late read's `read_at` is the garage clock's time at the write, as for every read (slice 2, ruling 6). Nothing on the snapshot says that its vehicle was already retracted; that can be worked out by comparing it with the retraction's `recorded_at` in `vehicle_history()`.
+- *(r2: moot, a late read is refused.)* A late read's `read_at` is the garage clock's time at the write, as for every read (slice 2, ruling 6). Nothing on the snapshot says that its vehicle was already retracted; that can be worked out by comparing it with the retraction's `recorded_at` in `vehicle_history()`.
 - Still open from the list above: deviations 4 to 6 and 9 (accepted as built by the rulings), 10 to 17. Not run by me on Linux or macOS.
+
+## Review round 2 response
+
+Verdict: `docs/notes/2026-11-15-garage-slice3-review-r2.md` (CHANGES REQUIRED: both round-1 findings resolved, one new finding). The finding: ruling 5 contradicts G7's consequence in the accepted record. The coordinator withdrew ruling 5. Commits: `1d1475e612b22a7b59a152709367d1f9d8c7cba2` (the verdict as received, and item 5 of the rulings note replaced with the text the coordinator dictated, nothing else in that file changed), `2c0e3d9cf6dffa2e7adca04aa04c2e07316c213a` (code and tests). The first run of the changed suite passed 46 of 46; no test failed in the worktree.
+
+**Change.**
+- `ObservationWriter::record_fault_read` (`observations.rs`), inside its `BEGIN IMMEDIATE` transaction, after the existing session-exists check and before any insert, asks whether the session's vehicle has a `vehicle_retraction` row. If so it returns the new `Error::VehicleRetracted(session_id)` ("session N is on a vehicle that has been retracted, so nothing more is recorded in it") and the transaction is dropped with nothing written.
+- The check is a join from the session to `vehicle_retraction` on `vehicle_id`, so a session bound to no vehicle (`vehicle_id` NULL) never matches and is unaffected. How a read finds its session is otherwise unchanged: it still takes the session id, and an unknown id is still `SessionNotFound`.
+- The doc comment of `record_fault_read` that round 1 changed now states the refusal. The header comment of test 8 now points to the refusal.
+- `observation_history` (ruling 4) is unchanged.
+
+**Test (replaces `session_started_before_retraction_can_finish_and_none_can_start`): `retracted_vehicle_takes_no_fault_read_and_no_new_session`.** Same fixture. While the vehicle is live, its session takes a complete read with one fault (so the refusal that follows is not for some other reason). After `retract_vehicle`: the same read, and a failed read, in that session each return `VehicleRetracted(session id)`; `start_session` under the vehicle's label and alias returns `NotFound`; the three observation counts and the full dumps of `session`, `fault_snapshot` and `fault_dtc` are unchanged; `observation_history` of the vehicle equals what it returned before the refused calls (one session, three reads). The other vehicle's session still takes the same read, and its history then has two reads.
+
+The NULL case is covered by the existing `unbound_session_belongs_to_no_vehicle`, which records a read in a session with no vehicle and was not changed.
+
+### Negative controls (round 2)
+
+Same method, from `git archive` of `2c0e3d9cf6dffa2e7adca04aa04c2e07316c213a`, each in its own copy with its own new `CARGO_TARGET_DIR` (`r2\r2a` …). `r2z`, with no edit and no filter, passed 46 of 46 (exit 0). The three controls exited 101.
+
+**r2a (the coordinator's control): the refusal removed** (1 edit: the `if retracted { return Err(…) }` deleted).
+```
+thread 'tests_observations::retracted_vehicle_takes_no_fault_read_and_no_new_session' panicked at crates\garage\src\tests_observations.rs:955:9:
+Complete([Dtc { code: 10887, status: 8 }]): Ok(FaultSnapshot { id: 5, session_id: 1, ecu_address: 41, read_at: 2026-11-14T03:30:00Z, read: Complete([Dtc { code: 10887, status: 8 }]), identity_conflict: IdentityConflict { vin: false, chassis: false }, provenance: Provenance { source: DiagwireRead, recorded_at: 2026-11-14T03:30:00Z, diagwire_rev: "0.1.0" } })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.05s
+```
+The read was stored for the retracted vehicle.
+
+**r2b: the refusal also catches a session with no vehicle** (1 edit: the check's query becomes "the session's `vehicle_id` is NULL or retracted").
+```
+thread 'tests_observations::unbound_session_belongs_to_no_vehicle' panicked at crates\garage\src\tests_observations.rs:500:10:
+called `Result::unwrap()` on an `Err` value: VehicleRetracted(2)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.03s
+```
+
+**r2c: resolution does not ignore retracted vehicles** (the nc19 edit), for "no new session can start".
+```
+thread 'tests_observations::retracted_vehicle_takes_no_fault_read_and_no_new_session' panicked at crates\garage\src\tests_observations.rs:962:9:
+assertion `left == right` failed: test car
+  left: Resolved(Session { id: 3, vehicle_id: Some(1), reported_vin: None, reported_chassis: None, identity_conflict: IdentityConflict { vin: false, chassis: false }, provenance: Provenance { source: DiagwireRead, recorded_at: 2026-11-14T03:30:00Z, diagwire_rev: "0.1.0" } })
+ right: NotFound
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.04s
+```
+
+Not controlled: "before any insert" as an ordering (a refusal after the insert would still roll back, because the transaction is dropped uncommitted; the test would not tell the two apart).
+
+### Gate results at `2c0e3d9` (worktree)
+
+Line counts: `lib.rs` 359, `observations.rs` 443, `tests_corrections.rs` 1042, `tests_observations.rs` 988.
+
+`cargo test --workspace --locked`: exit 0. Result lines in order (diagwire, diagwire-cli, diagwire-ds2, diagwire-garage, diagwire-hsfz, diagwire-uds, then the five doc-test binaries):
+```
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 46 tests
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+**62 passed, 0 failed** (garage 46; one test replaced, none added). No warning and no `SKIPPED` line.
+
+`cargo clippy --workspace --all-targets --locked -- -D warnings`: exit 0. Complete output of the recorded run:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.19s
+```
+It reused the check made by the same command on the same sources before the commit, which printed `Checking diagwire-garage …` and `Finished`, exit 0.
+
+### For the architect
+
+- **The refusal is a session-id check, not a reference resolution.** G7's text asks for a reference resolved in the write transaction. `record_fault_read` still takes a session id (slice 2's API, and the coordinator's instruction not to change how a read finds its session); the retraction check in the same transaction gives the same result for a retracted vehicle. It does not re-resolve anything else about the vehicle.
+- **What operations will see:** a read that completes on the car after its vehicle was retracted is returned as `VehicleRetracted` and is not stored. If that evidence should be kept, it needs the amendment the withdrawn ruling names.
+- **A retraction that commits while a read is waiting for the write lock** is seen by the read's check, because the check runs under `BEGIN IMMEDIATE`. Not tested with a rival connection.
+- Still open: deviations 10 to 17 above. The round-2 change has not been run by me on Linux or macOS.
