@@ -37,7 +37,7 @@ The clock returns UTC now = `2026-11-14T03:30:00Z` and local today = `2026-11-13
 
 1. **`replay1_ambiguous_reference_writes_nothing`.** Two vehicles share chassis `E46`. `add_service_event("e46")` returns `Ambiguous` listing both, with ids and labels, and the `service_event` count is unchanged. The unique alias `"  The   COUPE "` (normalisation: trim, collapse spaces, Unicode full case folding since r1) resolves to the coupe and writes one row. `"e90"` returns `NotFound`.
 2. **`provenance_set_by_writer`.** It writes a vehicle, a VIN, a dated event, an undated event, a supersede and a retraction. Every returned `Provenance` equals `{MaintainerEntry, NOW, REVISION}`. Every row in all three tables has `source='maintainer-entry'`, `recorded_at='2026-11-14T03:30:00.000000Z'` and `diagwire_rev=REVISION`. The undated event and the supersede take `event_date = 2026-11-13` (the clock's local today), and the dated one keeps its date. "No public write method accepts a source" is a property of the API's shape, checked by reading the signatures, not at runtime.
-3. **`append_only`.** Raw `UPDATE`/`DELETE` on `service_event`, `vehicle_ident` and `vehicle` each fail with `ConstraintViolation`, and full row dumps of all three tables are unchanged afterwards. At `0dfb484` only `service_event` and `vehicle_ident` were dumped; the `vehicle` dump was added in `c830699` (r1). A supersede adds a head (the default list shows only the new head). A second supersede of the same row fails in the API (`AlreadySuperseded`) and in storage (a raw insert hits UNIQUE), with the count unchanged. A retracted head is hidden by default and shown in history as `[(first,false),(second,false),(retraction,true)]`. A duplicate live alias on another vehicle (`" Commuter "` vs `commuter`) is refused (`IdentifierTaken(Alias)`), with the count unchanged. An odometer value without a unit is refused by the storage CHECK (raw insert); the API's `Odometer` type can't express one.
+3. **`append_only`.** Raw `UPDATE`/`DELETE` on `service_event`, `vehicle_ident` and `vehicle` each fail with `ConstraintViolation`, and full row dumps of all three tables are unchanged afterwards. At `0dfb484` only `service_event` and `vehicle_ident` were dumped; the `vehicle` dump was added in `c830699` (r1). A supersede adds a head (the default list shows only the new head). A second supersede of the same row fails in the API (`AlreadySuperseded`) and in storage (a raw insert hits UNIQUE), with the count unchanged. A retracted head is hidden by default and shown in history as `[(first,false),(second,false),(retraction,true)]`. Since A1 (`797b430`): superseding the retracted head returns `RetractionIsFinal` and the row count is unchanged; a fresh service event then succeeds and is the only live row; history shows `[…, (retraction,true), (fresh,false)]`. A duplicate live alias on another vehicle (`" Commuter "` vs `commuter`) is refused (`IdentifierTaken(Alias)`), with the count unchanged. An odometer value without a unit is refused by the storage CHECK (raw insert); the API's `Odometer` type can't express one.
 4. **`open_refuses_newer_version`, `open_refuses_foreign_and_empty_files`, `open_missing_creates_nothing_and_create_refuses_existing`.** Each refusal is checked on a cleanly closed file (no sidecars beforehand). Afterwards the main file is **byte-identical** (a full byte comparison, stronger than a hash) and no sidecar exists. Cases: `user_version=2` gives `TooNew{2,1}`; `application_id=0x12345678` gives `Foreign`; a database with a header but no application ID gives `Foreign(0)`; a zero-length file gives `Foreign(0)`. `open` on a missing path gives `Missing`, and the directory stays empty. `create` on an existing file gives `Exists` and leaves the contents unchanged. `create` where only a `-wal` exists gives `Exists` and makes no main file.
 5. **`failed_migration_rolls_back_table_and_version`.** A test-only step (version 2) runs `CREATE TABLE probe; PRAGMA user_version = 2; INSERT INTO no_such_table …` through the real runner `schema::migrate`. The step errors, and afterwards `(user_version, probe tables)` = `(1, 0)` on the same connection and on a fresh connection after close. **`user_version` reverts with the transaction**, so the record's "unverified (test 5)" row is now settled for SQLite 3.54.1 and the stop condition is not hit.
 6. **`busy_write_fails_without_writing`.** B opens with `busy_timeout = 0`. A raw connection A holds `BEGIN IMMEDIATE`. B's `add_vehicle` returns `Error::Busy`. After A rolls back, the vehicle count is 0. "Not retried" follows from the code (no retry loop) and the immediate return; it is not separately observable.
@@ -105,7 +105,7 @@ It is maintained by Andrew Gallant (BurntSushi), with active releases. It gives 
 - **Identifier supersede and retract were not implemented.** The slice outcome lists only *adding* identifiers. The schema (chain columns, triggers, same-vehicle trigger) already supports them.
 - **Duplicate-identifier rule, implemented literally from G6:** a new identifier is refused if it equals another vehicle's **live alias or VIN**. Labels and chassis may be shared; test 1 needs a shared chassis. A new alias equal to another vehicle's label is therefore allowed, and that reference then resolves as `Ambiguous`, which is safe.
 - ~~**Normalisation** uses `str::to_lowercase`, not full Unicode case folding.~~ Fixed in r1: it now uses full default case folding (`caseless`).
-- **Retraction semantics:** a retraction row copies its target's fields. Retracting an already-retracted head returns `AlreadyRetracted`. Superseding a retracted head is allowed and makes the new row live (an un-retract); the record doesn't address this. Per the dispatcher, this is left unchanged pending a DR-0002 amendment.
+- **Retraction semantics:** a retraction row copies its target's fields. Retracting an already-retracted head returns `AlreadyRetracted`. ~~Superseding a retracted head is allowed and makes the new row live (an un-retract); the record doesn't address this.~~ Resolved by DR-0002 amendment A1 (a retraction is final). Since `797b430`, superseding a retracted service-event head returns `RetractionIsFinal`; see the A1 section.
 - **`open` with a matching application ID but `user_version` 0 (or any version other than 1)** is refused as `UnknownVersion`, since v1 is creation only and there is nothing to migrate from. This is not tested. Test 4 covers newer, foreign and unmarked files.
 - **`create` failure after the file exists** leaves the partial file in place (documented on `create`). Nothing in garage deletes files. `open` refuses such a file, because its application ID is 0 or its version is 0.
 - **The SQLite floor refuses the fixed backports 3.44.6 and 3.50.7**, as the record specifies ("refuses any runtime `sqlite_version()` below 3.51.3").
@@ -251,3 +251,44 @@ Only warning: `unused workspace dependency diagwire-ds2` (pre-existing).
 `cargo clippy --workspace --all-targets`: exit 0. The same two pre-existing warnings outside garage: `unused workspace dependency diagwire-ds2`, and `clippy::chunks_exact_to_as_chunks` at `crates\uds\src\lib.rs:157` (lib and lib test, 1 duplicate). **Zero warnings from `diagwire-garage`.**
 
 No failed test was rerun, and no stop condition was hit. Linux remains unverified, as before.
+
+## A1: a retraction is final
+
+The maintainer accepted DR-0002 amendment A1 (main `e68237d`): G5 now says a retracted head cannot be superseded, and a mistaken retraction is undone by adding a new record, while history keeps the retraction. First-slice test 3 was extended to match. Round 2 code review had approved the slice with 0 findings before this change. Implemented for **service events only**, per the dispatcher. The A1 tests for identifiers and vehicles are owed by the slice that adds identifier correction and vehicle retraction.
+
+**Change (`797b430bbb757443c99985007fbb62ffc64434d2`).**
+- New error variant `Error::RetractionIsFinal(i64)`: "record {id} is retracted, and a retraction is final; add a new record instead".
+- In `RecordWriter::write_event`, after the target head is loaded inside the `BEGIN IMMEDIATE` transaction, a supersede (`input` present) of a head with `retracted = 1` returns `RetractionIsFinal` before any insert. The transaction is dropped, so nothing is written.
+- Retracting an already-retracted head still returns `AlreadyRetracted`.
+- Adding a fresh service event is unaffected.
+- No schema change: the rule is enforced in the API, like the existing head checks.
+
+**Test (extended): `append_only` (test 3).** After the existing retraction steps:
+- `supersede_service_event("daily", retraction.id, …)` returns `RetractionIsFinal(retraction.id)`, and the `service_event` count is unchanged;
+- `add_service_event("daily", …)` succeeds with `supersedes_id = None`;
+- the default list is exactly `[fresh]`;
+- history is `[(first,false), (second,false), (retraction,true), (fresh,false)]`, so the retraction stays visible.
+
+The final row-count assertion moved from `before + 1` to `before + 2` to account for the fresh row.
+
+**NC A1: finality check removed (1 edit: the six-line `RetractionIsFinal` block in `write_event` deleted).** Scratch copy `a1` of `797b430`, fresh `CARGO_TARGET_DIR` `a1-target` (confirmed non-existent), run with `cargo test --manifest-path <copy>/Cargo.toml -p diagwire-garage append_only`. My first attempt to launch it never ran cargo: a PowerShell variable-name collision (`$s` and `$S` are the same variable) garbled the target path, and `cmd` refused with "The command line is too long". No build happened, no test ran, and no target directory or log was created; I checked before relaunching. So the launch was repeated, but no test was rerun. Observed:
+```
+thread 'tests::append_only' (5304) panicked at crates\garage\src\tests.rs:309:5:
+assertion failed: matches!(g.record_writer().supersede_service_event("daily", retraction.id,
+    &oil(None)), Err(Error::RetractionIsFinal(id)) if id == retraction.id)
+test tests::append_only ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.02s
+```
+Without the check, superseding the retracted head is accepted (the old un-retract behaviour).
+
+**Results after A1 (worktree, default target dir).**
+
+`cargo test --workspace`: exit 0. Per binary: diagwire 0, diagwire-cli 0, diagwire-ds2 **5 passed**, diagwire-garage **13 passed**, diagwire-hsfz **6 passed**, diagwire-uds **5 passed**, all doc-tests 0. That is **29 passed, 0 failed**, and no SKIPPED line. The garage binary printed:
+```
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+Only warning: `unused workspace dependency diagwire-ds2` (pre-existing).
+
+`cargo clippy --workspace --all-targets`: exit 0. The same two pre-existing warnings outside garage: `unused workspace dependency diagwire-ds2`, and `clippy::chunks_exact_to_as_chunks` at `crates\uds\src\lib.rs:157` (lib and lib test, 1 duplicate). **Zero warnings from `diagwire-garage`.**
+
+No failed test was rerun, and no stop condition was hit.
