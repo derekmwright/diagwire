@@ -24,6 +24,8 @@ pub enum DecodeError {
     UnexpectedService { expected: u8, got: u8 },
     #[error("unexpected subfunction 0x{0:02X}")]
     UnexpectedSubfunction(u8),
+    #[error("unexpected data identifier 0x{0:04X}")]
+    UnexpectedIdentifier(u16),
 }
 
 pub fn read_dtc_by_status_mask(mask: u8) -> Vec<u8> {
@@ -167,6 +169,23 @@ pub fn parse_dtc_report(body: &[u8]) -> Result<DtcReport, DecodeError> {
     })
 }
 
+/// Checks the body of a positive ReadDataByIdentifier response (everything
+/// after the 0x62 SID) to a request for the single identifier `did`, and
+/// returns the data record that follows the echoed identifier.
+pub fn parse_data_by_id(did: u16, body: &[u8]) -> Result<&[u8], DecodeError> {
+    let [hi, lo, data @ ..] = body else {
+        return Err(DecodeError::Truncated);
+    };
+    let echoed = u16::from_be_bytes([*hi, *lo]);
+    if echoed != did {
+        return Err(DecodeError::UnexpectedIdentifier(echoed));
+    }
+    if data.is_empty() {
+        return Err(DecodeError::Truncated);
+    }
+    Ok(data)
+}
+
 pub fn nrc_name(nrc: u8) -> &'static str {
     match nrc {
         0x10 => "general reject",
@@ -244,5 +263,18 @@ mod tests {
         let names: Vec<_> = DtcStatus(0x89).flags().collect();
         assert_eq!(names, ["testFailed", "confirmed", "warningIndicatorRequested"]);
         assert_eq!(format!("{:?}", DtcStatus(0x00)), "0x00 []");
+    }
+
+    #[test]
+    fn data_by_id_returns_the_record_after_the_echoed_identifier() {
+        assert_eq!(parse_data_by_id(0xF190, &[0xF1, 0x90, 0x41, 0x42]), Ok(&[0x41, 0x42][..]));
+        assert_eq!(
+            parse_data_by_id(0xF190, &[0xF1, 0x8C, 0x41]),
+            Err(DecodeError::UnexpectedIdentifier(0xF18C))
+        );
+        // No identifier, half of one, and an identifier with no data.
+        assert_eq!(parse_data_by_id(0xF190, &[]), Err(DecodeError::Truncated));
+        assert_eq!(parse_data_by_id(0xF190, &[0xF1]), Err(DecodeError::Truncated));
+        assert_eq!(parse_data_by_id(0xF190, &[0xF1, 0x90]), Err(DecodeError::Truncated));
     }
 }

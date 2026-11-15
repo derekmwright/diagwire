@@ -36,6 +36,35 @@ enum Cmd {
         #[arg(long, value_parser = parse_hex_u8, default_value = "FF")]
         mask: u8,
     },
+    /// Ask each address in turn for its fault memory and list who answers.
+    /// An address that stays silent costs about 2 seconds.
+    Probe {
+        /// Vehicle IP address. Discovered automatically if omitted.
+        #[arg(long)]
+        ip: Option<IpAddr>,
+        /// First address to ask, in hex.
+        #[arg(long, value_parser = parse_hex_u8, default_value = "00")]
+        from: u8,
+        /// Last address to ask, in hex.
+        #[arg(long, value_parser = parse_hex_u8, default_value = "FF")]
+        to: u8,
+        /// DTC status mask in hex.
+        #[arg(long, value_parser = parse_hex_u8, default_value = "FF")]
+        mask: u8,
+    },
+    /// Read one data identifier from one ECU and print its bytes. diagwire
+    /// does not know what they mean.
+    Read {
+        /// Vehicle IP address. Discovered automatically if omitted.
+        #[arg(long)]
+        ip: Option<IpAddr>,
+        /// ECU diagnostic address in hex, e.g. 12 for the DME.
+        #[arg(long, value_parser = parse_hex_u8)]
+        ecu: u8,
+        /// Data identifier in hex, e.g. F190.
+        #[arg(long, value_parser = parse_hex_u16)]
+        did: u16,
+    },
     /// Print where the garage file is kept. Nothing is opened or created.
     GaragePath {
         /// Directory holding the garage. Overrides DIAGWIRE_GARAGE_DIR and
@@ -75,6 +104,58 @@ async fn main() -> Result<()> {
                 other => bail!("{}: {}; no fault list was read", label(ecu), describe(&other)),
             }
         }
+        Cmd::Probe { ip, from, to, mask } => {
+            let ip = match ip {
+                Some(ip) => ip,
+                None => find_vehicle().await?,
+            };
+            // The functional address and the tester's own are never asked.
+            let addresses: Vec<u8> = (from..=to).filter(|a| diagwire::is_single_ecu(*a)).collect();
+            let mut answered = 0;
+            let report = diagwire::probe(
+                || Session::connect(ip),
+                &addresses,
+                mask,
+                |probe| match &probe.faults {
+                    Ok(Outcome::Complete(report)) => {
+                        answered += 1;
+                        print_report(probe.ecu, report);
+                    }
+                    Ok(refused @ Outcome::Negative(_)) => {
+                        answered += 1;
+                        println!("{}: {}", label(probe.ecu), describe(refused));
+                    }
+                    Ok(Outcome::NoResponse) => {}
+                    Ok(other) => println!("{}: {}; no fault list was read", label(probe.ecu), describe(other)),
+                    Err(e) => println!("{}: {e}", label(probe.ecu)),
+                },
+            )
+            .await?;
+            println!("{answered} of {} addresses asked gave an answer.", report.probes.len());
+            if let Some(e) = report.stopped {
+                bail!(
+                    "stopped after {} of {} addresses: {e}",
+                    report.probes.len(),
+                    addresses.len()
+                );
+            }
+        }
+        Cmd::Read { ip, ecu, did } => {
+            let ip = match ip {
+                Some(ip) => ip,
+                None => find_vehicle().await?,
+            };
+            let mut session = Session::connect(ip)
+                .await
+                .with_context(|| format!("connecting to {ip}"))?;
+            match session.read_data(ecu, did).await? {
+                Outcome::Complete(data) => {
+                    println!("{} identifier {did:04X}: {} byte(s), uninterpreted", label(ecu), data.len());
+                    println!("  {}", hsfz::hex(&data));
+                }
+                other => bail!("{}: {}; nothing was read", label(ecu), describe(&other)),
+            }
+        }
         Cmd::GaragePath { garage_dir } => {
             let resolved = garage_path::resolve(
                 garage_dir.as_deref(),
@@ -99,6 +180,11 @@ async fn find_vehicle() -> Result<IpAddr> {
 fn parse_hex_u8(s: &str) -> Result<u8, String> {
     let digits = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     u8::from_str_radix(digits, 16).map_err(|e| format!("{s:?} is not a hex byte: {e}"))
+}
+
+fn parse_hex_u16(s: &str) -> Result<u16, String> {
+    let digits = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    u16::from_str_radix(digits, 16).map_err(|e| format!("{s:?} is not a hex identifier: {e}"))
 }
 
 fn label(ecu: u8) -> String {

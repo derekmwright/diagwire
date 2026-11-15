@@ -61,6 +61,25 @@ pub enum Outcome<T> {
 pub enum Error {
     #[error(transparent)]
     Transport(#[from] hsfz::Error),
+    #[error("service 0x{0:02X} is not on the read list; nothing was sent")]
+    NotARead(u8),
+    #[error("address 0x{0:02X} is not a single control unit; nothing was sent")]
+    AddressNotAllowed(u8),
+}
+
+/// The only services an operation may send (DR-0001 amendment A1): read
+/// fault information and read data by identifier. `transact` refuses any
+/// other before anything is written.
+pub const READ_SERVICES: [u8; 2] = [uds::sid::READ_DTC_INFO, uds::sid::READ_DATA_BY_ID];
+
+/// The functional address the spike used to reach every control unit at
+/// once. Functional requests are disabled in v0 (D10).
+const FUNCTIONAL_ALL: u8 = 0xDF;
+
+/// True for an address a read may be sent to: not the functional address
+/// and not the tester's own.
+pub fn is_single_ecu(address: u8) -> bool {
+    address != FUNCTIONAL_ALL && address != hsfz::TESTER_ADDR
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -103,6 +122,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             .await
     }
 
+    /// Reads one data identifier from one ECU and returns its bytes as the
+    /// ECU sent them. Nothing here knows what they mean.
+    pub async fn read_data(&mut self, ecu: u8, did: u16) -> Result<Outcome<Vec<u8>>> {
+        self.transact(ecu, &uds::read_data_by_id(did), |body| {
+            uds::parse_data_by_id(did, body).map(<[u8]>::to_vec)
+        })
+        .await
+    }
+
     /// One transaction with one ECU. `decode` validates the body of the
     /// positive response, and the connection is kept only if it accepts.
     async fn transact<T>(
@@ -112,6 +140,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         decode: impl Fn(&[u8]) -> std::result::Result<T, uds::DecodeError>,
     ) -> Result<Outcome<T>> {
         let service = request[0];
+        if !READ_SERVICES.contains(&service) {
+            return Err(Error::NotARead(service));
+        }
+        if !is_single_ecu(ecu) {
+            return Err(Error::AddressNotAllowed(ecu));
+        }
         let start = Instant::now();
         let deadline = start + self.timing.operation;
 
@@ -151,6 +185,70 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             }
         }
     }
+}
+
+/// What one address did when asked for its fault memory.
+#[derive(Debug)]
+pub struct Probe {
+    pub ecu: u8,
+    pub faults: Result<Outcome<uds::DtcReport>>,
+}
+
+#[derive(Debug)]
+pub struct ProbeReport {
+    /// One entry per address asked, in the order asked.
+    pub probes: Vec<Probe>,
+    /// Set when a connection could not be opened. The addresses after the
+    /// last entry of `probes` were never asked.
+    pub stopped: Option<Error>,
+}
+
+/// Asks each address in turn for its fault memory: one transaction at a
+/// time, never the functional address (DR-0001 amendment A1). An address
+/// that does not answer costs its timeout and a new connection, because the
+/// old one is closed (D10). `connect` is called for the first address and
+/// again after every such failure.
+///
+/// `on_probe` sees each result as soon as it is in, so a front end can show
+/// progress.
+///
+/// Fails before any I/O if `addresses` holds one that is not a single ECU.
+pub async fn probe<S, C, F>(
+    mut connect: C,
+    addresses: &[u8],
+    mask: u8,
+    mut on_probe: impl FnMut(&Probe),
+) -> Result<ProbeReport>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: FnMut() -> F,
+    F: Future<Output = Result<Session<S>>>,
+{
+    if let Some(&bad) = addresses.iter().find(|&&address| !is_single_ecu(address)) {
+        return Err(Error::AddressNotAllowed(bad));
+    }
+    let mut report = ProbeReport {
+        probes: Vec::with_capacity(addresses.len()),
+        stopped: None,
+    };
+    let mut session: Option<Session<S>> = None;
+    for &ecu in addresses {
+        let live = match session.as_mut().filter(|session| !session.is_disposed()) {
+            Some(live) => live,
+            None => match connect().await {
+                Ok(new) => session.insert(new),
+                Err(e) => {
+                    report.stopped = Some(e);
+                    break;
+                }
+            },
+        };
+        let faults = live.read_dtcs(ecu, mask).await;
+        let probe = Probe { ecu, faults };
+        on_probe(&probe);
+        report.probes.push(probe);
+    }
+    Ok(report)
 }
 
 /// Maps a transport failure onto an outcome. The transport has already

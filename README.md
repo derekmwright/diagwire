@@ -16,7 +16,9 @@ Open-source, cross-platform BMW diagnostics in Rust, built to be driven by an AI
 
 ```
 diagwire discover
-diagwire dtc --ecu 12     # the DME's fault memory
+diagwire dtc --ecu 12                # the DME's fault memory
+diagwire probe --from 00 --to 7F     # ask each address in turn; lists who answers
+diagwire read --ecu 12 --did F190    # one data identifier, as raw bytes
 ```
 
 Set `RUST_LOG=debug` to log every frame in hex.
