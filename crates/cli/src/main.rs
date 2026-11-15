@@ -1,10 +1,13 @@
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use diagwire::{Outcome, Session, ecu_name, hsfz, uds};
 use tracing_subscriber::EnvFilter;
+
+mod garage_path;
 
 /// BMW diagnostics over ENET (F/G-series). Set RUST_LOG=debug to see raw frames.
 #[derive(Parser)]
@@ -32,6 +35,13 @@ enum Cmd {
         /// DTC status mask in hex.
         #[arg(long, value_parser = parse_hex_u8, default_value = "FF")]
         mask: u8,
+    },
+    /// Print where the garage file is kept. Nothing is opened or created.
+    GaragePath {
+        /// Directory holding the garage. Overrides DIAGWIRE_GARAGE_DIR and
+        /// the per-user default.
+        #[arg(long)]
+        garage_dir: Option<PathBuf>,
     },
 }
 
@@ -64,6 +74,14 @@ async fn main() -> Result<()> {
                 Outcome::Complete(report) => print_report(ecu, &report),
                 other => bail!("{}: {}; no fault list was read", label(ecu), describe(&other)),
             }
+        }
+        Cmd::GaragePath { garage_dir } => {
+            let resolved = garage_path::resolve(
+                garage_dir.as_deref(),
+                garage_path::Platform::current(),
+                |name| std::env::var_os(name),
+            )?;
+            println!("{}", resolved.file().display());
         }
     }
     Ok(())
