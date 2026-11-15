@@ -150,14 +150,15 @@ pub fn parse_dtc_report(body: &[u8]) -> Result<DtcReport, DecodeError> {
     if *sub != REPORT_DTC_BY_STATUS_MASK {
         return Err(DecodeError::UnexpectedSubfunction(*sub));
     }
-    if records.len() % 4 != 0 {
+    let (records, rest) = records.as_chunks::<4>();
+    if !rest.is_empty() {
         return Err(DecodeError::Truncated);
     }
     let dtcs = records
-        .chunks_exact(4)
-        .map(|r| Dtc {
-            code: u32::from_be_bytes([0, r[0], r[1], r[2]]),
-            status: DtcStatus(r[3]),
+        .iter()
+        .map(|&[hi, mid, lo, status]| Dtc {
+            code: u32::from_be_bytes([0, hi, mid, lo]),
+            status: DtcStatus(status),
         })
         .collect();
     Ok(DtcReport {
