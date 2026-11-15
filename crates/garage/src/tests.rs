@@ -48,7 +48,9 @@ fn count(conn: &Connection, table: &str) -> i64 {
 }
 
 fn sidecars_absent(path: &Path) -> bool {
-    sidecars(path)[1..].iter().all(|p| !p.exists())
+    sidecars(path)[1..]
+        .iter()
+        .all(|p| !entry_exists(p).unwrap())
 }
 
 fn oil(date: Option<Date>) -> ServiceEventInput {
@@ -67,6 +69,10 @@ fn resolved<T: std::fmt::Debug>(o: Outcome<T>) -> T {
         Outcome::Resolved(t) => t,
         other => panic!("expected Resolved, got {other:?}"),
     }
+}
+
+fn label_of(label: &Option<Identifier>) -> Option<&str> {
+    label.as_ref().map(|l| l.value.as_str())
 }
 
 fn is_constraint(r: rusqlite::Result<usize>) -> bool {
@@ -120,18 +126,18 @@ fn replay1_ambiguous_reference_writes_nothing() {
         .record_writer()
         .add_service_event("e46", &oil(None))
         .unwrap();
+    let Outcome::Ambiguous(candidates) = out else {
+        panic!("expected Ambiguous, got {out:?}");
+    };
     assert_eq!(
-        out,
-        Outcome::Ambiguous(vec![
-            Candidate {
-                vehicle_id: coupe.id,
-                label: Some("Silver coupe".into())
-            },
-            Candidate {
-                vehicle_id: sedan.id,
-                label: Some("Blue sedan".into())
-            },
-        ])
+        candidates
+            .iter()
+            .map(|c| (c.vehicle_id, label_of(&c.label)))
+            .collect::<Vec<_>>(),
+        [
+            (coupe.id, Some("Silver coupe")),
+            (sedan.id, Some("Blue sedan"))
+        ]
     );
     assert_eq!(count(&g.conn, "service_event"), before);
 
@@ -141,7 +147,7 @@ fn replay1_ambiguous_reference_writes_nothing() {
             .unwrap(),
     );
     assert_eq!(event.vehicle_id, coupe.id);
-    assert_eq!(event.vehicle_label.as_deref(), Some("Silver coupe"));
+    assert_eq!(label_of(&event.vehicle_label), Some("Silver coupe"));
     assert_eq!(count(&g.conn, "service_event"), before + 1);
     assert_eq!(
         g.record_writer()
@@ -234,6 +240,7 @@ fn append_only() {
 
     let events = dump(&g.conn, "service_event");
     let idents = dump(&g.conn, "vehicle_ident");
+    let vehicles = dump(&g.conn, "vehicle");
     for sql in [
         "UPDATE service_event SET summary = 'edited'",
         "DELETE FROM service_event",
@@ -249,6 +256,7 @@ fn append_only() {
     }
     assert_eq!(dump(&g.conn, "service_event"), events);
     assert_eq!(dump(&g.conn, "vehicle_ident"), idents);
+    assert_eq!(dump(&g.conn, "vehicle"), vehicles);
 
     // Supersede adds a head; the old row stays in history.
     let corrected = ServiceEventInput {
@@ -462,7 +470,10 @@ fn busy_write_fails_without_writing() {
 fn durable_connection_and_sqlite_floor() {
     let (_dir, path, g) = new_garage();
     drop(g);
-    let g = Garage::open(&path, clock(), &Options::default()).unwrap();
+    let options = Options {
+        busy_timeout: Duration::from_millis(1234),
+    };
+    let g = Garage::open(&path, clock(), &options).unwrap();
     let get = |name: &str| -> String {
         g.conn
             .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -478,6 +489,7 @@ fn durable_connection_and_sqlite_floor() {
     assert_eq!(get("synchronous"), "2");
     assert_eq!(get("foreign_keys"), "1");
     assert_eq!(get("journal_mode"), "wal");
+    assert_eq!(get("busy_timeout"), "1234");
     let version: String = g
         .conn
         .query_row("SELECT sqlite_version()", [], |r| r.get(0))
@@ -497,5 +509,206 @@ fn durable_connection_and_sqlite_floor() {
         ("x", false),
     ] {
         assert_eq!(sqlite_version_ok(v), ok, "{v}");
+    }
+}
+
+// Review round 1, finding 1: an out-of-range busy timeout is an error, never
+// a panic, and is refused before anything touches the filesystem.
+#[test]
+fn busy_timeout_out_of_range_refused_before_any_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sub").join("garage.db");
+    for bad in [Duration::MAX, Duration::from_millis(i32::MAX as u64 + 1)] {
+        let options = Options { busy_timeout: bad };
+        assert!(matches!(
+            Garage::create(&path, clock(), &options),
+            Err(Error::BusyTimeoutOutOfRange(d)) if d == bad
+        ));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "{bad:?}");
+    }
+
+    // The largest value SQLite takes is accepted and read back.
+    let max = Options {
+        busy_timeout: Duration::from_millis(i32::MAX as u64),
+    };
+    drop(Garage::create(&path, clock(), &max).unwrap());
+    let before = fs::read(&path).unwrap();
+    let too_big = Options {
+        busy_timeout: Duration::MAX,
+    };
+    assert!(matches!(
+        Garage::open(&path, clock(), &too_big),
+        Err(Error::BusyTimeoutOutOfRange(_))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(sidecars_absent(&path));
+}
+
+// Review round 1, finding 2: full Unicode case folding, the same for stored
+// identifiers and incoming references.
+#[test]
+fn unicode_case_folding_for_identifiers_and_references() {
+    let (_dir, _path, mut g) = new_garage();
+    let street = g.record_writer().add_vehicle("Straße").unwrap();
+    for reference in ["STRASSE", "strasse", "Straße", "  STRAßE "] {
+        let r = resolved(g.resolve(reference).unwrap());
+        assert_eq!(r.vehicle_id, street.id, "{reference}");
+    }
+    // Final sigma folds like medial sigma.
+    let greek = g.record_writer().add_vehicle("ΣΊΣΥΦΟΣ").unwrap();
+    assert_eq!(resolved(g.resolve("σίσυφος").unwrap()).vehicle_id, greek.id);
+
+    // The fold also drives the duplicate-alias check.
+    resolved(
+        g.record_writer()
+            .add_identifier("strasse", IdentKind::Alias, "Weiß")
+            .unwrap(),
+    );
+    let idents = count(&g.conn, "vehicle_ident");
+    assert!(matches!(
+        g.record_writer()
+            .add_identifier("σίσυφος", IdentKind::Alias, "WEISS"),
+        Err(Error::IdentifierTaken(IdentKind::Alias))
+    ));
+    assert_eq!(count(&g.conn, "vehicle_ident"), idents);
+}
+
+/// A clock whose `now` a test can move, to tell rows apart by time.
+struct SteppingClock(std::sync::Mutex<Timestamp>);
+
+impl SteppingClock {
+    fn set(&self, ts: &str) {
+        *self.0.lock().unwrap() = ts.parse().unwrap();
+    }
+}
+
+impl Clock for SteppingClock {
+    fn now(&self) -> Timestamp {
+        *self.0.lock().unwrap()
+    }
+    fn today(&self) -> Date {
+        TODAY
+    }
+}
+
+// Review round 1, finding 3: resolution results and ambiguity candidates
+// carry provenance, for the anchor and for each identifier, from the right row.
+#[test]
+fn resolution_carries_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(SteppingClock(std::sync::Mutex::new(NOW.parse().unwrap())));
+    let mut g =
+        Garage::create(&dir.path().join("g.db"), clock.clone(), &Options::default()).unwrap();
+    let at = |ts: &str| Provenance {
+        source: Source::MaintainerEntry,
+        recorded_at: ts.parse().unwrap(),
+        diagwire_rev: REVISION.into(),
+    };
+    let (t1, t2, t3, t4) = (
+        "2026-01-01T00:00:00Z",
+        "2026-02-01T00:00:00Z",
+        "2026-03-01T00:00:00Z",
+        "2026-04-01T00:00:00Z",
+    );
+    clock.set(t1);
+    let coupe = g.record_writer().add_vehicle("Coupe").unwrap();
+    clock.set(t2);
+    resolved(
+        g.record_writer()
+            .add_identifier("coupe", IdentKind::Alias, "the coupe")
+            .unwrap(),
+    );
+    clock.set(t3);
+    let sedan = g.record_writer().add_vehicle("Sedan").unwrap();
+    clock.set(t4);
+    for v in ["coupe", "sedan"] {
+        resolved(
+            g.record_writer()
+                .add_identifier(v, IdentKind::Chassis, "E46")
+                .unwrap(),
+        );
+    }
+
+    let r = resolved(g.resolve("The Coupe").unwrap());
+    assert_eq!(r.vehicle_id, coupe.id);
+    assert_eq!(r.provenance, at(t1), "anchor provenance");
+    assert_eq!(r.label.as_ref().map(|l| &l.provenance), Some(&at(t1)));
+    assert_eq!(
+        r.matched
+            .iter()
+            .map(|m| (m.kind, m.value.as_str(), &m.provenance))
+            .collect::<Vec<_>>(),
+        [(IdentKind::Alias, "the coupe", &at(t2))]
+    );
+
+    let Outcome::Ambiguous(candidates) = g.resolve("e46").unwrap() else {
+        panic!("expected Ambiguous");
+    };
+    let summary: Vec<_> = candidates
+        .iter()
+        .map(|c| {
+            (
+                c.vehicle_id,
+                c.provenance.clone(),
+                c.label.as_ref().map(|l| l.provenance.clone()),
+                c.matched
+                    .iter()
+                    .map(|m| m.provenance.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (coupe.id, at(t1), Some(at(t1)), vec![at(t4)]),
+            (sedan.id, at(t3), Some(at(t3)), vec![at(t4)]),
+        ]
+    );
+}
+
+// Review round 1, finding 4: a dangling symlink at a sidecar (or the main
+// path) is still a directory entry, so `create` refuses.
+#[cfg(unix)]
+fn dangling_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn dangling_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[test]
+fn create_refuses_dangling_symlink_entries() {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garage.db");
+        let link = PathBuf::from(format!("{}{suffix}", path.display()));
+        if let Err(e) = dangling_symlink(&dir.path().join("nowhere"), &link) {
+            // Written to stderr directly, which libtest does not capture, so
+            // the skip shows in normal `cargo test` output.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED create_refuses_dangling_symlink_entries: cannot create a symlink \
+                 here ({e}); on Windows this needs Developer Mode or \
+                 SeCreateSymbolicLinkPrivilege"
+            );
+            return;
+        }
+        assert!(!link.exists(), "the link must dangle");
+        assert!(
+            matches!(
+                Garage::create(&path, clock(), &Options::default()),
+                Err(Error::Exists)
+            ),
+            "{suffix:?}"
+        );
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [link.file_name().unwrap()], "{suffix:?}");
     }
 }

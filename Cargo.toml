@@ -14,6 +14,7 @@ diagwire-uds = { path = "crates/uds" }
 diagwire-ds2 = { path = "crates/ds2" }
 
 anyhow = "1"
+caseless = "0.2"
 clap = { version = "4", features = ["derive"] }
 jiff = "0.2"
 rusqlite = { version = "=0.42.0", features = ["bundled"] }

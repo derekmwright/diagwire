@@ -149,17 +149,24 @@ pub struct Odometer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome<T> {
     Resolved(T),
-    Ambiguous(Vec<Candidate>),
+    Ambiguous(Vec<VehicleRef>),
     NotFound,
 }
 
-/// A reference resolved to a vehicle id.
-pub type Resolution = Outcome<i64>;
+/// A reference resolved to one vehicle.
+pub type Resolution = Outcome<VehicleRef>;
 
+/// A vehicle a reference named, as a resolution result or an ambiguity
+/// candidate. Carries the anchor's provenance and, through each
+/// [`Identifier`], the provenance of its label and of what matched (G4).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
+pub struct VehicleRef {
     pub vehicle_id: i64,
-    pub label: Option<String>,
+    /// The `vehicle` anchor row's provenance.
+    pub provenance: Provenance,
+    pub label: Option<Identifier>,
+    /// The live identifiers equal to the reference.
+    pub matched: Vec<Identifier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +183,7 @@ pub struct Identifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vehicle {
     pub id: i64,
-    pub label: Option<String>,
+    pub label: Option<Identifier>,
     /// Live identifiers only.
     pub identifiers: Vec<Identifier>,
     pub provenance: Provenance,
@@ -186,7 +193,7 @@ pub struct Vehicle {
 pub struct ServiceEvent {
     pub id: i64,
     pub vehicle_id: i64,
-    pub vehicle_label: Option<String>,
+    pub vehicle_label: Option<Identifier>,
     /// The local date meant.
     pub event_date: Date,
     pub summary: String,
@@ -204,12 +211,11 @@ pub struct ServiceEventInput {
     pub odometer: Option<Odometer>,
 }
 
-/// Trim, case-fold and collapse spaces. No fuzzy matching (G7).
-fn normalize(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+/// Trim, collapse spaces and apply Unicode full default case folding
+/// (`Straße` and `STRASSE` both fold to `strasse`). Used for stored
+/// `value_norm` and for incoming references alike. No fuzzy matching (G7).
+pub(crate) fn normalize(s: &str) -> String {
+    caseless::default_case_fold_str(&s.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Adds maintainer records. Every write is one `BEGIN IMMEDIATE`
@@ -266,7 +272,7 @@ impl<'g> RecordWriter<'g> {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let vehicle_id = match resolve(&tx, reference)? {
-            Outcome::Resolved(id) => id,
+            Outcome::Resolved(r) => r.vehicle_id,
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
@@ -325,7 +331,7 @@ impl<'g> RecordWriter<'g> {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let vehicle_id = match resolve(&tx, reference)? {
-            Outcome::Resolved(id) => id,
+            Outcome::Resolved(r) => r.vehicle_id,
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
@@ -387,7 +393,7 @@ impl Garage {
     pub fn vehicle(&self, reference: &str) -> Result<Outcome<Vehicle>> {
         let tx = self.conn.unchecked_transaction()?;
         Ok(match resolve(&tx, reference)? {
-            Outcome::Resolved(id) => Outcome::Resolved(load_vehicle(&tx, id)?),
+            Outcome::Resolved(r) => Outcome::Resolved(load_vehicle(&tx, r.vehicle_id)?),
             Outcome::Ambiguous(c) => Outcome::Ambiguous(c),
             Outcome::NotFound => Outcome::NotFound,
         })
@@ -422,7 +428,7 @@ impl Garage {
     fn events(&self, reference: &str, sql: &str) -> Result<Outcome<Vec<ServiceEvent>>> {
         let tx = self.conn.unchecked_transaction()?;
         let vehicle_id = match resolve(&tx, reference)? {
-            Outcome::Resolved(id) => id,
+            Outcome::Resolved(r) => r.vehicle_id,
             Outcome::Ambiguous(c) => return Ok(Outcome::Ambiguous(c)),
             Outcome::NotFound => return Ok(Outcome::NotFound),
         };
@@ -440,27 +446,46 @@ impl Garage {
 fn resolve(conn: &Connection, reference: &str) -> Result<Resolution> {
     let norm = normalize(reference);
     let mut stmt = conn.prepare(concat!(
-        "SELECT DISTINCT i.vehicle_id FROM vehicle_ident i WHERE i.value_norm = ?1 AND ",
+        "SELECT ",
+        ident_cols!(),
+        " FROM vehicle_ident i WHERE i.value_norm = ?1 AND ",
         live!("vehicle_ident", "i"),
-        " ORDER BY i.vehicle_id"
+        " ORDER BY i.vehicle_id, i.id"
     ))?;
-    let ids = stmt
-        .query_map([norm], |r| r.get::<_, i64>(0))?
+    let matches = stmt
+        .query_map([norm], ident_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(match ids.as_slice() {
-        [] => Outcome::NotFound,
-        [id] => Outcome::Resolved(*id),
-        _ => Outcome::Ambiguous(
-            ids.iter()
-                .map(|&vehicle_id| {
-                    Ok(Candidate {
-                        vehicle_id,
-                        label: live_label(conn, vehicle_id)?,
-                    })
-                })
-                .collect::<Result<_>>()?,
-        ),
+    let mut refs: Vec<VehicleRef> = Vec::new();
+    for ident in matches {
+        match refs.last_mut() {
+            Some(r) if r.vehicle_id == ident.vehicle_id => r.matched.push(ident),
+            _ => refs.push(vehicle_ref(conn, ident)?),
+        }
+    }
+    Ok(match refs.len() {
+        0 => Outcome::NotFound,
+        1 => Outcome::Resolved(refs.remove(0)),
+        _ => Outcome::Ambiguous(refs),
     })
+}
+
+/// A [`VehicleRef`] for the vehicle `first` (a matched identifier) is on.
+fn vehicle_ref(conn: &Connection, first: Identifier) -> Result<VehicleRef> {
+    let vehicle_id = first.vehicle_id;
+    Ok(VehicleRef {
+        vehicle_id,
+        provenance: vehicle_provenance(conn, vehicle_id)?,
+        label: live_label(conn, vehicle_id)?,
+        matched: vec![first],
+    })
+}
+
+fn vehicle_provenance(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Provenance> {
+    conn.query_row(
+        "SELECT source, recorded_at, diagwire_rev FROM vehicle WHERE id = ?1",
+        [vehicle_id],
+        |r| provenance_from_row(r, 0),
+    )
 }
 
 fn insert_ident(
@@ -521,25 +546,24 @@ fn head_event(conn: &Connection, vehicle_id: i64, target: i64) -> Result<Service
     Ok(event)
 }
 
-fn live_label(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Option<String>> {
+/// The vehicle's newest live label, with its provenance.
+fn live_label(conn: &Connection, vehicle_id: i64) -> rusqlite::Result<Option<Identifier>> {
     conn.query_row(
         concat!(
-            "SELECT i.value FROM vehicle_ident i WHERE i.vehicle_id = ?1 AND i.kind = 'label' AND ",
+            "SELECT ",
+            ident_cols!(),
+            " FROM vehicle_ident i WHERE i.vehicle_id = ?1 AND i.kind = 'label' AND ",
             live!("vehicle_ident", "i"),
             " ORDER BY i.id DESC LIMIT 1"
         ),
         [vehicle_id],
-        |r| r.get(0),
+        ident_from_row,
     )
     .optional()
 }
 
 fn load_vehicle(conn: &Connection, vehicle_id: i64) -> Result<Vehicle> {
-    let provenance = conn.query_row(
-        "SELECT source, recorded_at, diagwire_rev FROM vehicle WHERE id = ?1",
-        [vehicle_id],
-        |r| provenance_from_row(r, 0),
-    )?;
+    let provenance = vehicle_provenance(conn, vehicle_id)?;
     let mut stmt = conn.prepare(concat!(
         "SELECT ",
         ident_cols!(),
@@ -584,7 +608,10 @@ fn ident_from_row(r: &Row<'_>) -> rusqlite::Result<Identifier> {
     })
 }
 
-fn event_from_row(r: &Row<'_>, vehicle_label: Option<String>) -> rusqlite::Result<ServiceEvent> {
+fn event_from_row(
+    r: &Row<'_>,
+    vehicle_label: Option<Identifier>,
+) -> rusqlite::Result<ServiceEvent> {
     let odo_value: Option<u32> = r.get(4)?;
     let odo_unit: Option<String> = r.get(5)?;
     let odometer = match (odo_value, odo_unit) {
