@@ -226,7 +226,7 @@ warning: `diagwire-uds` (lib test) generated 1 warning (1 duplicate)
 
 For the architect. None blocked the slice, but each is a choice the record does not make.
 
-1. *(r1: settled by ruling 1; `vehicle_id` is now NOT NULL.)* **How a session is bound to a vehicle.** The record gives `session.vehicle_id` as nullable and says a discovery conflict is stored on the session, but not how the vehicle is chosen. I applied G7's general rule (a reference, resolved in the write transaction; `Ambiguous`/`NotFound` write nothing). So this slice's writer cannot create a session with no vehicle, although the column allows it; the operations slice (automatic logging of reads of a car not in the garage, Q2) will need a ruling.
+1. *(r1 made `vehicle_id` NOT NULL under ruling 1; r2: ruling 1 was withdrawn and the column is nullable again, as described here. The gap stands: no writer creates an unbound session; that belongs to the operations slice.)* **How a session is bound to a vehicle.** The record gives `session.vehicle_id` as nullable and says a discovery conflict is stored on the session, but not how the vehicle is chosen. I applied G7's general rule (a reference, resolved in the write transaction; `Ambiguous`/`NotFound` write nothing). So this slice's writer cannot create a session with no vehicle, although the column allows it; the operations slice (automatic logging of reads of a car not in the garage, Q2) will need a ruling.
 2. *(r1: implemented, ruling 2; see the last section.)* **Replay 6 is not implemented.** `reported_vin` and `reported_chassis` are stored as given and returned, never compared with the vehicle's identifiers, and nothing is flagged. Identifiers are never changed by a session.
 3. **`open` migrates.** The record says how a migration must run, not what triggers it. `Garage::open` migrates an older garage. `create` is unchanged (new file, all steps, no backup).
 4. **Backup file name and lifetime** (above): the name; refusing rather than overwriting an existing entry (two migration attempts of one garage within the same UTC second, after a crash that left the first backup, would hit this); removing a backup taken in this call when it is stale or the migration fails; keeping the backup after a successful migration indefinitely. Nothing prunes backups. A crash between backup and commit leaves a valid backup behind.
@@ -300,6 +300,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out;
 - Existing-test changes: `Session`/`FaultSnapshot` literals gained the new field. The raw-insert backstop check in `observations_carry_diagwire_read_provenance` now supplies the two new NOT NULL columns and asserts the error text is the `source` CHECK; without that it would have been refused for the missing columns instead.
 
 ### 3. Ruling 1: `session.vehicle_id` NOT NULL
+
+*(r2) Reverted: ruling 1 was withdrawn in round 2. At the current tip the column is nullable, `Session.vehicle_id` is `Option<i64>`, and the test and control below no longer exist. What follows describes `8999ffb` only.*
 
 Edited in migration v2. `Session.vehicle_id` is now `i64`.
 
@@ -383,3 +385,68 @@ That run reused the check from the same command run earlier on the same sources 
 ### Still open after round 1
 
 Unchanged from the list above: items 4 (accepted, ruling 4), 6, 7, 9 (accepted, ruling 6), 12, 13, 14, 15 and 16. The Unix-only assertion (backup mode 0600) has not been run by me; the coordinator reports CI passed on Linux and macOS at the previous tip, which I did not observe. The round-1 changes have not been run on a second platform by me.
+
+## Review round 2 response
+
+Verdict: `docs/notes/2026-11-14-garage-slice2-review-r2.md` (CHANGES REQUIRED: the four round-1 findings resolved, one new finding). The finding: ruling 1's `session.vehicle_id NOT NULL` contradicts the accepted record's schema sketch (`vehicle_id` NULL). The coordinator withdrew ruling 1. Commits: `ab6ec6ad2ed60efdd53f8cd9f8d6976480852bfa` (the verdict as received, and the two edits to the rulings note the coordinator dictated: item 1 replaced, one sentence of the opening paragraph changed, nothing else), `483f567f5c2bec3fe435b9b9bea0c2030e5d3ba1` (code). The first run of the changed suite passed 30 of 30; no test failed in the worktree.
+
+**Change.**
+- Migration v2: `session.vehicle_id INTEGER REFERENCES vehicle(id)`, nullable, as in the original slice (`19d6c2f`).
+- `Session.vehicle_id` is `Option<i64>` again, matching the column. `ObservationWriter::start_session` still always resolves a reference and writes a vehicle; no writer creates an unbound session.
+- Test `storage_refuses_a_session_without_a_vehicle` and its control (r1nc3) are removed.
+- No production logic changed for unbound rows; I checked the two paths the coordinator named:
+  - Identity conflict: computed only in `start_session`, after the reference resolved, so it never runs without a vehicle. A raw unbound row carries whatever flags it was inserted with; reading them (`record_fault_read`'s result, the query) does not involve the vehicle.
+  - `latest_measured_faults`: both the outer filter and the "newest complete" subquery compare `vehicle_id = ?1`, which is never true for NULL, so an unbound session's snapshots are returned for no vehicle and cannot become another vehicle's `latest_complete`. `Session` is only built from a row in `start_session`; nothing else reads `vehicle_id` into a non-optional type.
+
+**Test (new): `unbound_session_belongs_to_no_vehicle`.** A vehicle with one bound session, and a session inserted by raw SQL with `vehicle_id` NULL. `record_fault_read` on the unbound session stores a complete read with one fault on ECU 0x12 and returns it whole (session id, fault, no conflict flags, `diagwire-read` provenance) without error; counts are `[2, 1, 1]`. `latest_measured_faults` for the vehicle is empty. After a failed read of the same ECU in the bound session, the vehicle's result is that one attempt with `latest_complete: None`: the unbound session's complete read is not used.
+
+**NC r2nc1: the query's outer filter also admits unbound sessions (1 edit: `WHERE s.vehicle_id = ?1` → `WHERE (s.vehicle_id = ?1 OR s.vehicle_id IS NULL)`).** Scratch copy of `483f567` at `nc-r2\r2nc1` with a fresh `CARGO_TARGET_DIR`, same method as before; exit 101.
+```
+thread 'tests_observations::unbound_session_belongs_to_no_vehicle' panicked at crates\garage\src\tests_observations.rs:488:5:
+assertion `left == right` failed
+  left: Resolved([EcuFaults { ecu_address: 18, latest_complete: Some(FaultSnapshot { id: 1, session_id: 2, ecu_address: 18, read_at: 2026-11-14T03:30:00Z, read: Complete([Dtc { code: 10882, status: 36 }]), identity_conflict: IdentityConflict { vin: false, chassis: false }, provenance: Provenance { source: DiagwireRead, recorded_at: 2026-11-14T03:30:00Z, diagwire_rev: "0.1.0" } }), newer_attempts: [] }])
+ right: Resolved([])
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.02s
+```
+The unbound session's read was returned as the vehicle's. The "no panic" half has no separate control: there is no guard to break, the paths simply never read `vehicle_id` as non-null.
+
+**Statements in this note the reversal made untrue, corrected in place:** deviation item 1's round-1 annotation, and round-1 section 3 (marked as describing `8999ffb` only). The round-1 statement "garage 30: 13 from slice 1, 17 from this slice" still holds in number: one test removed, one added.
+
+Line counts at `483f567`: `lib.rs` 337, `schema.rs` 264, `backup.rs` 65, `observations.rs` 361, `records.rs` 696, `tests.rs` 747, `tests_migration.rs` 348, `tests_observations.rs` 675.
+
+### Results at `483f567` (worktree, default target dir)
+
+`cargo test --workspace --locked`: exit 0. Result lines in order (diagwire, diagwire-cli, diagwire-ds2, diagwire-garage, diagwire-hsfz, diagwire-uds, then five doc-test binaries):
+```
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+**46 passed, 0 failed.** No SKIPPED line. Only warning: `unused workspace dependency diagwire-ds2`.
+
+`cargo clippy -p diagwire-garage --all-targets --locked -- -D warnings`: exit 0. Complete output:
+```
+warning: unused workspace dependency `diagwire-ds2`
+  --> Cargo.toml:14:1
+   |
+14 | diagwire-ds2 = { path = "crates/ds2" }
+   | ^^^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_dependencies` is set to `warn` by default
+help: consider removing the workspace dependency `diagwire-ds2`
+warning: workspace (manifest) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+```
+As in round 1, this run reused the check made by the same command on the same sources just before the commit (which printed `Checking diagwire-garage` and finished clean). The warning is cargo's manifest warning, not a clippy lint.
+
+### Still open after round 2
+
+Deviation item 1 (no writer for unbound sessions; owed by the operations slice) and the list under "Still open after round 1". The reviewer's remark that the identity-conflict tests do not exercise superseded or retracted identifiers is correct: this crate has no identifier supersede or retract yet, so such rows cannot be made through the API; the filtering rests on the shared `live!` predicate. The round-2 change has not been run on a second platform by me.
