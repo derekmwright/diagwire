@@ -90,6 +90,10 @@ pub enum Error {
     SessionNotFound(i64),
     #[error("vehicle {0} not found")]
     VehicleNotFound(i64),
+    #[error(
+        "session {0} is on a vehicle that has been retracted, so nothing more is recorded in it"
+    )]
+    VehicleRetracted(i64),
     #[error("identifier is empty")]
     EmptyIdentifier,
     #[error("service event summary is empty")]

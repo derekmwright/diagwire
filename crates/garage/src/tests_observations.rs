@@ -914,19 +914,49 @@ fn measurements_of_a_retracted_vehicle_stay_in_history() {
     ));
 }
 
-// Slice 3 review round 1, ruling 5: a session started before its vehicle
-// was retracted may still record a fault read; no new session can start.
-// The late read is in the history read and in no default query.
+// Slice 3 review round 2 (ruling 5 withdrawn; G7): once a vehicle is
+// retracted, a fault read in a session started before the retraction is
+// refused and writes nothing, and no new session can start. The history
+// read is unchanged.
 #[test]
-fn session_started_before_retraction_can_finish_and_none_can_start() {
-    let (_dir, mut g, car, _other, session, other_session) = two_measured_vehicles();
+fn retracted_vehicle_takes_no_fault_read_and_no_new_session() {
+    let (_dir, mut g, car, other, session, other_session) = two_measured_vehicles();
+    let late_read = FaultRead::Complete(vec![dtc(0x2A87, 0x08)]);
+
+    // While the vehicle is live, the session takes this very read.
+    let accepted = g
+        .observation_writer()
+        .record_fault_read(session.id, 0x29, &late_read)
+        .unwrap();
+    assert_eq!(accepted.read, late_read);
+
     resolved(
         g.record_writer()
             .retract_vehicle("test car", "Entered twice")
             .unwrap(),
     );
-    let before = observation_counts(&g.conn);
+    let counts = observation_counts(&g.conn);
+    let stored = OBSERVATION_TABLES.map(|t| dump(&g.conn, t));
+    let history = g.observation_history(car.id).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|s| (s.session.id, s.fault_reads.len()))
+            .collect::<Vec<_>>(),
+        [(session.id, 3)]
+    );
 
+    // The same read, and a failed read, in the same session are now
+    // refused: no snapshot row and no fault row is added.
+    for read in [&late_read, &FaultRead::NoResponse] {
+        let result = g
+            .observation_writer()
+            .record_fault_read(session.id, 0x29, read);
+        assert!(
+            matches!(result, Err(Error::VehicleRetracted(id)) if id == session.id),
+            "{read:?}: {result:?}"
+        );
+    }
     // No new session, under any of the vehicle's references.
     for reference in ["test car", "the tester"] {
         assert_eq!(
@@ -937,58 +967,22 @@ fn session_started_before_retraction_can_finish_and_none_can_start() {
             "{reference}"
         );
     }
-    assert_eq!(observation_counts(&g.conn), before);
+    assert_eq!(observation_counts(&g.conn), counts);
+    assert_eq!(OBSERVATION_TABLES.map(|t| dump(&g.conn, t)), stored);
+    // The history read is unchanged.
+    assert_eq!(g.observation_history(car.id).unwrap(), history);
 
-    // The session started before the retraction still takes a read.
-    let late_read = FaultRead::Complete(vec![dtc(0x2A87, 0x08)]);
-    let late = g
+    // The refusal is about the retracted vehicle only: the other vehicle's
+    // session still takes a read.
+    let fine = g
         .observation_writer()
-        .record_fault_read(session.id, 0x29, &late_read)
+        .record_fault_read(other_session.id, 0x29, &late_read)
         .unwrap();
+    assert_eq!(fine.session_id, other_session.id);
     assert_eq!(
-        late,
-        FaultSnapshot {
-            id: late.id,
-            session_id: session.id,
-            ecu_address: 0x29,
-            read_at: NOW.parse().unwrap(),
-            read: late_read,
-            identity_conflict: IdentityConflict::default(),
-            provenance: measured(NOW),
-        }
+        g.observation_history(other.id).unwrap()[0]
+            .fault_reads
+            .len(),
+        2
     );
-    assert_eq!(
-        observation_counts(&g.conn),
-        [before[0], before[1] + 1, before[2] + 1]
-    );
-
-    // It is in the history read, after the session's earlier reads.
-    let history = g.observation_history(car.id).unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].session, session);
-    assert_eq!(history[0].fault_reads.len(), 3);
-    assert_eq!(history[0].fault_reads[2], late);
-
-    // It is in no default query: the vehicle's references find no vehicle,
-    // and the one reference that still resolves (the shared chassis) names
-    // the other vehicle, whose result does not hold it.
-    for reference in ["test car", "the tester"] {
-        assert_eq!(
-            g.latest_measured_faults(reference).unwrap(),
-            Outcome::NotFound,
-            "{reference}"
-        );
-    }
-    for reference in ["e46", "other car"] {
-        let faults = resolved(g.latest_measured_faults(reference).unwrap());
-        assert_eq!(
-            faults
-                .iter()
-                .flat_map(|e| e.latest_complete.iter().chain(&e.newer_attempts))
-                .map(|s| (s.id == late.id, s.session_id))
-                .collect::<Vec<_>>(),
-            [(false, other_session.id)],
-            "{reference}"
-        );
-    }
 }

@@ -214,9 +214,9 @@ impl<'g> ObservationWriter<'g> {
     /// Stores one read attempt of the ECU at `ecu_address`, taken in
     /// `session_id`. The snapshot and its fault rows are one transaction:
     /// either all of it is stored or none. A failed read stores its failure
-    /// kind and no faults. A session whose vehicle has since been retracted
-    /// still takes its reads: what the car reported is kept. Such a read is
-    /// returned by [`Garage::observation_history`] only.
+    /// kind and no faults. Refused, with nothing written, if the session's
+    /// vehicle has been retracted: a retracted vehicle takes no more writes
+    /// (G7). A session bound to no vehicle is not affected.
     pub fn record_fault_read(
         &mut self,
         session_id: i64,
@@ -234,6 +234,16 @@ impl<'g> ObservationWriter<'g> {
         )?;
         if !known {
             return Err(Error::SessionNotFound(session_id));
+        }
+        let retracted: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM session s
+                JOIN vehicle_retraction r ON r.vehicle_id = s.vehicle_id
+               WHERE s.id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if retracted {
+            return Err(Error::VehicleRetracted(session_id));
         }
         tx.execute(
             "INSERT INTO fault_snapshot (session_id, ecu_address, outcome, nrc, read_at)
