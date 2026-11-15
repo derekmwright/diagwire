@@ -10,6 +10,8 @@ use tokio::time::Instant;
 pub use diagwire_hsfz as hsfz;
 pub use diagwire_uds as uds;
 
+pub mod redact;
+
 #[cfg(test)]
 mod tests;
 
