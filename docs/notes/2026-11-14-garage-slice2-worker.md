@@ -1,5 +1,7 @@
 # Garage slice 2: worker result note
 
+*Corrected after review round 1 (see the last section). The sections up to "Deviations" describe the code at `19d6c2f`; what round 1 changed is in the last section, and corrected statements are marked "(r1)".*
+
 **Date:** 2026-11-14. **Record:** DR-0002, "Next slice: the observation writer, sessions and fault snapshots, with replays 3 and 5", plus the G3 backup-before-migrating mechanism. **Branch:** `worktree-agent-ad8ca35d48345661a`. **Code commit:** `19d6c2f2bb60f63a0bcf01b7f8d28cdffff32e14`. Windows 11, Rust 1.100.0. No stop condition was hit. No test failed in the worktree at any point (the first run of the new tests passed 26 of 26), so nothing was rerun.
 
 ## What was built
@@ -74,7 +76,7 @@ All use `tempfile` directories and the injected `FixedClock` (now = `2026-11-14T
 12. **`observation_tables_are_append_only`.** Raw `UPDATE` and `DELETE` on `session`, `fault_snapshot` and `fault_dtc` each fail with `ConstraintViolation`; full dumps of all three are unchanged.
 13. **`storage_refuses_faults_under_a_failed_read`.** Raw inserts are refused: a `fault_dtc` row under a failed snapshot; a `negative` snapshot without an NRC; a `complete` one with an NRC; an unknown outcome. Counts unchanged.
 
-**Slice-1 tests changed** (only because `LATEST` is now 2): `open_refuses_newer_version` sets `user_version` to `LATEST + 1` and expects `TooNew { found: 3, supported: 2 }`; `failed_migration_rolls_back_table_and_version` uses a failing step at version 3 and expects `(2, 0)`. With the old step number the step would have been skipped and the test would have passed without testing anything.
+**Slice-1 tests changed** (only because `LATEST` is now 2): `open_refuses_newer_version` sets `user_version` to `LATEST + 1` and expects `TooNew { found: 3, supported: 2 }`; `failed_migration_rolls_back_table_and_version` uses a failing step at version 3 and expects `(2, 0)`. ~~With the old step number the step would have been skipped and the test would have passed without testing anything.~~ (r1) That was wrong: with the old step number (2) the step would have been skipped on a v2 garage, `migrate` would have returned `Ok`, and the test's `matches!(…, Err(Error::Sqlite(_)))` assertion would have failed. The step number was changed so the test still exercises a failing step, not to stop it passing vacuously.
 
 ## Negative controls
 
@@ -224,20 +226,160 @@ warning: `diagwire-uds` (lib test) generated 1 warning (1 duplicate)
 
 For the architect. None blocked the slice, but each is a choice the record does not make.
 
-1. **How a session is bound to a vehicle.** The record gives `session.vehicle_id` as nullable and says a discovery conflict is stored on the session, but not how the vehicle is chosen. I applied G7's general rule (a reference, resolved in the write transaction; `Ambiguous`/`NotFound` write nothing). So this slice's writer cannot create a session with no vehicle, although the column allows it; the operations slice (automatic logging of reads of a car not in the garage, Q2) will need a ruling.
-2. **Replay 6 is not implemented.** `reported_vin` and `reported_chassis` are stored as given and returned, never compared with the vehicle's identifiers, and nothing is flagged. Identifiers are never changed by a session.
+1. *(r1: settled by ruling 1; `vehicle_id` is now NOT NULL.)* **How a session is bound to a vehicle.** The record gives `session.vehicle_id` as nullable and says a discovery conflict is stored on the session, but not how the vehicle is chosen. I applied G7's general rule (a reference, resolved in the write transaction; `Ambiguous`/`NotFound` write nothing). So this slice's writer cannot create a session with no vehicle, although the column allows it; the operations slice (automatic logging of reads of a car not in the garage, Q2) will need a ruling.
+2. *(r1: implemented, ruling 2; see the last section.)* **Replay 6 is not implemented.** `reported_vin` and `reported_chassis` are stored as given and returned, never compared with the vehicle's identifiers, and nothing is flagged. Identifiers are never changed by a session.
 3. **`open` migrates.** The record says how a migration must run, not what triggers it. `Garage::open` migrates an older garage. `create` is unchanged (new file, all steps, no backup).
 4. **Backup file name and lifetime** (above): the name; refusing rather than overwriting an existing entry (two migration attempts of one garage within the same UTC second, after a crash that left the first backup, would hit this); removing a backup taken in this call when it is stale or the migration fails; keeping the backup after a successful migration indefinitely. Nothing prunes backups. A crash between backup and commit leaves a valid backup behind.
-5. **Unbounded re-backup.** The record sets no limit on "backs up again". Each repeat needs another connection to commit in the window, but there is no cap and no error for it.
+5. *(r1: bounded at 3 backups, ruling 3.)* **Unbounded re-backup.** The record sets no limit on "backs up again". Each repeat needs another connection to commit in the window, but there is no cap and no error for it.
 6. **Backup durability rests on the lang_vacuum quote**, not on a test. The new directory entry is not separately synced on Unix.
 7. **`session.source` CHECK allows only `diagwire-read`.** The record's backstop is "measured values", which also names `canonical-capture:<tool>`; v0 has no such writer and the record requires a D4 stamp reference when one is added, so that migration would widen the CHECK.
 8. **`nrc` column.** Not in the schema sketch ("key columns only"); added because D10's `Negative(nrc)` carries it.
 9. **Types of `ecu_address`, `code`, `status`**: `u8`, `u32`, `u8`, mirroring `diagwire-uds` (`Dtc { code: u32, status }`, one status byte). The register marks that DTC layout unverified, and DS2 fault shapes are unknown. `garage` does not depend on `uds`.
 10. **`read_at` comes from the garage's clock at write time**; the writer takes no time parameter. If operations needs the instant of the read itself, the API must change.
-11. **"Newest" is write order** (snapshot id), not `read_at` order. They differ only if the clock steps backwards between writes. Not pinned by a test.
+11. **"Newest" is write order** (snapshot id), not `read_at` order. ~~They differ only if the clock steps backwards between writes. Not pinned by a test.~~ (r1) They can differ in two ways: the clock steps backwards between writes, or two connections write concurrently. `record_fault_read` takes `read_at` from the clock before it acquires the write lock, so a writer that took the later time can commit first. Ruling 5 confirms write order; it is now pinned by a test.
 12. **Residual in storage:** a raw SQL insert can add a `fault_dtc` row to an existing complete snapshot (append-only forbids edits, not additions). The API has no such path.
 13. **`FaultRead`, `Dtc`, `Session`, `SessionInput`, `EcuFaults`, `FaultSnapshot`** are new public types in `garage`; operations will have to map D10's outcome and the codec's DTCs onto them.
 14. **Both capabilities come from `Garage`** (`record_writer`, `observation_writer`), as slice 1 started. Whoever holds a `Garage` can get either; G2's rule that the MCP write tier and import hold only a `RecordWriter` is for operations to enforce by what it hands out.
 15. **Not tested:** `Busy` during the migration (code path: the backup is removed and `Busy` returned, same branch as test 6); a non-UTF-8 garage path (the backup fails with `InvalidInput`); the re-read of `user_version` under the lock differing (unreachable given the `data_version` check); `TooNew` under the lock (same). Unix-only assertions and code paths (0600 on the backup) were not compiled or run here; no Linux environment. The record's second-platform requirement is open until CI runs this branch.
 16. **Observation for the architect, not implemented:** taking the backup from a second connection while the migrating connection already holds `BEGIN IMMEDIATE` would need no `data_version` check and no loop in WAL mode. It is a different protocol from G3's, so I did not use it.
 17. **Attribution:** commits carry no attribution lines, per the dispatcher's rule and this repository's history. The session harness asked for a `Co-Authored-By`/session trailer; the stricter repository rule was followed.
+
+## Review round 1 response
+
+Verdict: `docs/notes/2026-11-14-garage-slice2-review-r1.md` (CHANGES REQUIRED: 2 findings, 2 note nits). Rulings: `docs/notes/2026-11-14-garage-slice2-architect-rulings.md`. Both files were committed as received in `cfaedcf16be607219a8261a3c68da78620e9b4c1`. Code changes: `8999ffbb9293f7b5715d869f7b27432e569d88b4`. Only `crates/garage` and this note changed. The first run of the changed test suite passed 30 of 30; no test failed in the worktree, so nothing was rerun.
+
+Line counts at `8999ffb`: `lib.rs` 337, `schema.rs` 263, `backup.rs` 65, `observations.rs` 359, `records.rs` 696, `tests.rs` 747, `tests_migration.rs` 348, `tests_observations.rs` 641.
+
+### 1. Review finding 1: the session DELETE trigger test was masked
+
+Confirmed: in `observation_tables_are_append_only` the only session had snapshots, so `DELETE FROM session` was also refused by the foreign key. The test now adds a second session that nothing refers to and asserts that `DELETE FROM session WHERE id = <it>` fails with an error containing `append-only` (the trigger's message), before the six unfiltered statements. Counts are now `[2, 2, 1]`.
+
+**NC r1nc1: `session_no_delete` removed from v2 (1 edit).**
+```
+thread 'tests_observations::observation_tables_are_append_only' panicked at crates\garage\src\tests_observations.rs:401:10:
+called `Result::unwrap_err()` on an `Ok` value: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.02s
+```
+The lone session was deleted (1 row). The round-0 control for this test (NC11) removed a different trigger, which is why it did not show the gap.
+
+### 2. Review finding 2 / ruling 2: identity conflict (G7, replay 6)
+
+**Change.**
+- `session` (migration v2, edited in place) gains `vin_conflict` and `chassis_conflict`, each `INTEGER NOT NULL CHECK (… IN (0, 1))`.
+- `start_session`, inside its `BEGIN IMMEDIATE` transaction and after resolving the reference, calls `records::live_ident_disagrees(conn, vehicle_id, kind, reported)` for the reported VIN and the reported chassis. It is true when the vehicle has at least one live identifier of that kind and none equals the reported value, both normalised by the same `normalize` that identifiers and references use. No live identifier of that kind: not a conflict. Nothing reported (`None`), or a value that normalises to empty: not a conflict.
+- The two flags are written in the session's `INSERT` and are never updated (the table is append-only). The reported values are stored as given.
+- New public type `IdentityConflict { vin: bool, chassis: bool }` with `any()`. `Session.identity_conflict` and `FaultSnapshot.identity_conflict` carry it; a snapshot's comes from its session's row, so `record_fault_read` results and `latest_measured_faults` both return it.
+- The session is always written. Nothing in this path writes `vehicle` or `vehicle_ident`.
+
+**Test (new): `replay6_identity_conflict_is_flagged_and_changes_nothing`.** A vehicle with VIN `TESTVIN0000000001` and chassis `E46`, and a vehicle with neither. Seven sessions, each returned flag compared:
+- different VIN, no chassis → VIN flagged;
+- same VIN in other case and spacing, chassis `E90` → chassis flagged;
+- both different → both flagged;
+- both the same (other case, leading space) → none;
+- nothing reported → none;
+- blank values → none;
+- both reported on the vehicle with no VIN or chassis → none.
+
+All seven sessions are stored, with `(vin_conflict, chassis_conflict)` on each row as expected, and the reported text as given. A read in the both-flagged session and one in a clean session carry `(true, true)` and `(false, false)` from the writer and, compared whole, from `latest_measured_faults`. Full dumps of `vehicle` and `vehicle_ident` are unchanged; the stored VIN still resolves to the vehicle and the conflicting one resolves to nothing.
+
+**NC r1nc2: comparison skipped (1 edit: `if norm.is_empty()` → `if true` in `live_ident_disagrees`, so it always answers "no conflict").**
+```
+thread 'tests_observations::replay6_identity_conflict_is_flagged_and_changes_nothing' panicked at crates\garage\src\tests_observations.rs:537:9:
+  left: IdentityConflict { vin: false, chassis: false }
+ right: IdentityConflict { vin: true, chassis: false }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.04s
+```
+(The `assertion … failed` line between the first two is omitted here; the lines shown are as printed.) The first case, a different VIN, came back unflagged.
+
+**Choices in this change, for the architect:**
+- The flag says which field conflicted, nothing more. The conflicting stored value is not copied to the session.
+- With more than one live VIN (or chassis) on a vehicle, a reported value equal to any of them is not a conflict.
+- A blank reported value is treated as not reported.
+- The flag is fixed at insert. If the identifiers are later corrected, old sessions keep their flag.
+- `records.rs` gained the helper, because the "live" rule lives there; the text check of replay 3 still passes (the helper names no observation table).
+- Existing-test changes: `Session`/`FaultSnapshot` literals gained the new field. The raw-insert backstop check in `observations_carry_diagwire_read_provenance` now supplies the two new NOT NULL columns and asserts the error text is the `source` CHECK; without that it would have been refused for the missing columns instead.
+
+### 3. Ruling 1: `session.vehicle_id` NOT NULL
+
+Edited in migration v2. `Session.vehicle_id` is now `i64`.
+
+**Test (new): `storage_refuses_a_session_without_a_vehicle`.** A raw insert with `vehicle_id` NULL and every other column valid fails with `NOT NULL constraint failed: session.vehicle_id`; no row is added.
+
+**NC r1nc3: NOT NULL removed from that column (1 edit).**
+```
+thread 'tests_observations::storage_refuses_a_session_without_a_vehicle' panicked at crates\garage\src\tests_observations.rs:461:10:
+called `Result::unwrap_err()` on an `Ok` value: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.03s
+```
+
+### 4. Ruling 3: bounded backup retry
+
+**Change.** `schema::MAX_BACKUPS = 3`. `upgrade`'s loop runs at most three times; each stale backup is removed as before; after the third, it returns the new `Error::BackupOutrun(3)` ("other writers changed the garage after each of 3 backups, so it was not migrated"). `open` returns it unchanged. Nothing was migrated and no backup remains.
+
+**Test (new): `migration_gives_up_after_three_outrun_backups`.** The second-connection hook commits a `vehicle` row after every backup, capped at 5 commits so that an unbounded loop would terminate (by succeeding on the sixth backup) and fail the assertion. Result: `Err(BackupOutrun(3))`, exactly 3 backup calls, `user_version` still 1, no v2 table, 5 vehicles (the fixture's 2 unchanged plus the other writer's 3), the other v1 tables unchanged, and the directory holds only `garage.db`. "The garage is unchanged" therefore means unchanged by the migration; the other writer's own commits are in it. The existing one-commit test still takes exactly 2 backups and succeeds. The test drives `schema::upgrade`; no test reaches `BackupOutrun` through `Garage::open`, which passes the error through with `?`.
+
+**NC r1nc4: bound removed (2 edits: `for _ in 0..MAX_BACKUPS` → `loop`, and the final `Err(…)` deleted).**
+```
+thread 'tests_migration::migration_gives_up_after_three_outrun_backups' panicked at crates\garage\src\tests_migration.rs:285:5:
+Ok(2)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.09s
+```
+Without the bound the migration kept going and succeeded on the sixth backup. The build also warned `constant MAX_BACKUPS is never used`, as expected from the edit.
+
+### 5. Ruling 5 / review nit 4: "newest" is write order
+
+**Test (new): `newest_is_write_order_not_timestamp_order`.** On one ECU: a complete read with a fault written first at T3, a failed read written second at T2, a complete read with no faults written last at T1 (ids ascending, timestamps descending, both asserted). The query returns the last-written complete read with no newer attempts.
+
+**NC r1nc5: the query picks the latest complete read by `read_at` (2 edits in the subquery: `max(c.id)` → `c.id`, plus `ORDER BY c.read_at DESC LIMIT 1`).** The whole-result assertion at `tests_observations.rs:633:5` failed: `left` has `newer_attempts: [FaultSnapshot { id: 2, … read: NoResponse … }]` where `right` has `newer_attempts: []`, i.e. the timestamp-ordered query treated the failed read written before the latest complete read as newer than it.
+```
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.02s
+```
+Note item 11 is corrected above: concurrent writers, not only a clock stepping back, can separate the two orders, because the time is taken before the write lock.
+
+### 6. Review nit 3
+
+Corrected in place under "Slice-1 tests changed": the old step number would have made that test fail, not pass.
+
+### NC method (round 1)
+
+As before: one scratch copy of the committed `8999ffb` state per control under the session scratchpad (`nc-r1\r1nc1` … `r1nc5`), each with a fresh `CARGO_TARGET_DIR` (the script aborts if either directory exists), edits by exact unique text replacement, `cargo test --manifest-path <copy>\Cargo.toml -p diagwire-garage <filter>`. All five exited 101. The worktree was not edited for a control; `git status` was clean afterwards.
+
+### Results at `8999ffb` (worktree, default target dir)
+
+`cargo test --workspace --locked`: exit 0. Result lines in order: diagwire `0 passed`; diagwire-cli `0 passed`; diagwire-ds2
+```
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+diagwire-garage
+```
+running 30 tests
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+```
+diagwire-hsfz
+```
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+diagwire-uds
+```
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+and all five doc-test binaries `0 passed`. **46 passed, 0 failed** (garage 30: 13 from slice 1, 17 from this slice). No SKIPPED line. Only warning: `unused workspace dependency diagwire-ds2`.
+
+`cargo clippy -p diagwire-garage --all-targets --locked -- -D warnings`: exit 0. Complete output of the recorded run:
+```
+warning: unused workspace dependency `diagwire-ds2`
+  --> Cargo.toml:14:1
+   |
+14 | diagwire-ds2 = { path = "crates/ds2" }
+   | ^^^^^^^^^^^^
+   |
+   = note: `cargo::unused_workspace_dependencies` is set to `warn` by default
+help: consider removing the workspace dependency `diagwire-ds2`
+warning: workspace (manifest) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s
+```
+That run reused the check from the same command run earlier on the same sources (which printed `Checking diagwire-garage` and finished clean), so it shows no `Checking` line. The one warning is cargo's manifest warning, not a clippy lint, and is pre-existing.
+
+### Still open after round 1
+
+Unchanged from the list above: items 4 (accepted, ruling 4), 6, 7, 9 (accepted, ruling 6), 12, 13, 14, 15 and 16. The Unix-only assertion (backup mode 0600) has not been run by me; the coordinator reports CI passed on Linux and macOS at the previous tip, which I did not observe. The round-1 changes have not been run on a second platform by me.
